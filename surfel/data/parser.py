@@ -1,0 +1,648 @@
+"""COLMAP dataset parser: model + images + depth -> :class:`Split`.
+
+The pipeline is intentionally a sequence of explicit, checkable steps rather
+than one function, because each step has a failure mode that is invisible
+downstream:
+
+1. read the model (``colmap_io``);
+2. find the image directory and decide the render grid
+   (``resolution``) -- the step whose absence cost 8-12 dB in this project;
+3. build cameras, attaching per-frame depth with its **own** intrinsics;
+4. split train/val;
+5. apply the gauge (poses + points + depth together);
+6. derive the scene statistics that the trainer and strategy consume.
+
+Step 6 deserves emphasis: ``scene_scale`` for the densification strategy and
+``depth_scale`` for the disparity loss are *different numbers derived from
+different distributions*. Conflating them is what the earlier session's analysis
+called out as "the pristine gauge variable that decides whether a run is sane".
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Sequence, Tuple
+
+import numpy as np
+
+from ..config.schema import Config
+from .colmap_io import ColmapModel, ColmapCamera, read_colmap_model
+from .depth import (
+    DepthCalibration,
+    find_depth_file,
+    load_depth_scales,
+    median_scale,
+    read_depth,
+)
+from .gauge import (
+    GaugeApplication,
+    GaugeSource,
+    apply_gauge,
+    camera_extent,
+    depth_quantiles,
+    derive_scale,
+    derive_scene_scale,
+    Sim3,
+    estimate_sim3,
+    sim3_residual,
+    trajectory_span,
+)
+from .resolution import (
+    ResolutionPolicy,
+    probe_image_size,
+    resolve_image_dir,
+)
+from .scene import Camera, Scene, Split, scene_subset
+
+
+class DatasetError(RuntimeError):
+    """A dataset cannot be used as configured, for a stated reason."""
+
+
+@dataclass
+class ParseReport:
+    """What the parser decided, for the run manifest."""
+
+    image_dir: str
+    render_sizes: List[Tuple[int, int]]
+    n_images: int
+    n_train: int
+    n_val: int
+    n_points: int
+    depth_maps: int
+    depth_remapped: int
+    gauge: Optional[GaugeApplication]
+    notes: List[str]
+
+    def describe(self) -> str:
+        lines = [
+            f"image dir    : {self.image_dir}",
+            f"render sizes : {sorted(set(self.render_sizes))}",
+            f"images       : {self.n_images} (train {self.n_train} / val {self.n_val})",
+            f"init points  : {self.n_points}",
+            f"depth maps   : {self.depth_maps}/{self.n_images}"
+            + (
+                f"  ({self.depth_remapped} ray-remapped to the render grid)"
+                if self.depth_remapped
+                else ""
+            ),
+        ]
+        if self.gauge is not None:
+            lines.append(self.gauge.describe())
+        lines.extend(f"note         : {n}" for n in self.notes)
+        return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Camera construction
+# --------------------------------------------------------------------------
+def _build_cameras(
+    model: ColmapModel,
+    image_dir: Path,
+    cfg: Config,
+    *,
+    depth_scales: Optional[dict] = None,
+    reference_scale: float = 1.0,
+    notes: Optional[List[str]] = None,
+) -> Tuple[List[Camera], List[Tuple[int, int]]]:
+    """One :class:`Camera` per model image, with depth attached."""
+    notes = notes if notes is not None else []
+    policy = ResolutionPolicy(
+        factor=cfg.data.factor,
+        target_long_edge=cfg.data.target_long_edge,
+        min_long_edge=cfg.data.min_long_edge,
+    )
+    depth_cfg = cfg.data.depth
+    depth_dir = None
+    if depth_cfg.enabled and depth_cfg.dir:
+        depth_dir = Path(depth_cfg.dir)
+        if not depth_dir.is_absolute():
+            depth_dir = Path(cfg.data.path) / depth_dir
+        if not depth_dir.is_dir():
+            raise DatasetError(
+                f"depth.enabled=True but depth.dir does not exist: {depth_dir}"
+            )
+
+    cameras: List[Camera] = []
+    sizes: List[Tuple[int, int]] = []
+    missing_images: List[str] = []
+    missing_depth: int = 0
+
+    for idx, im in enumerate(model.sorted_images()):
+        colmap_cam = model.cameras[im.camera_id]
+        model_size = (colmap_cam.width, colmap_cam.height)
+
+        image_path = image_dir / im.name
+        if not image_path.exists():
+            # COLMAP names can carry subdirectories relative to images/.
+            alt = image_dir / Path(im.name).name
+            if alt.exists():
+                image_path = alt
+            else:
+                missing_images.append(im.name)
+                continue
+
+        file_size = probe_image_size(image_path)
+        resolved = policy.resolve(model_size, file_size)
+        K = resolved.scale_K(colmap_cam.K)
+        sizes.append((resolved.width, resolved.height))
+
+        cam = Camera(
+            name=im.name,
+            image_path=image_path,
+            K=K,
+            width=resolved.width,
+            height=resolved.height,
+            cam_to_world=im.cam_to_world,
+            index=idx,
+        )
+
+        if depth_dir is not None:
+            cam.depth_path = find_depth_file(depth_dir, im.name, depth_cfg.suffix)
+            if cam.depth_path is None:
+                missing_depth += 1
+            else:
+                raw = read_depth(cam.depth_path)
+                if raw is None:
+                    cam.depth_path = None
+                    missing_depth += 1
+                else:
+                    cam.depth_hw = (int(raw.shape[0]), int(raw.shape[1]))
+
+                    # The depth grid's intrinsics. When the model already
+                    # carries intrinsics for exactly this grid there is nothing
+                    # to infer; otherwise the exporter must have told us, and
+                    # assuming "same as the render camera" is the mistake this
+                    # field exists to prevent.
+                    if cam.depth_hw == (colmap_cam.height, colmap_cam.width):
+                        cam.depth_K = colmap_cam.K.copy()
+                    elif (
+                        cam.depth_hw
+                        == (resolved.height, resolved.width)
+                    ):
+                        cam.depth_K = K.copy()
+                    else:
+                        # Derive from the model intrinsics by the resolution
+                        # ratio. This is exactly right for a depth map produced
+                        # by resizing the same pinhole image (the common
+                        # feed-forward export), and it is *checked* rather than
+                        # assumed at load time by ``depth_grid_differs``.
+                        sy = cam.depth_hw[0] / float(colmap_cam.height)
+                        sx = cam.depth_hw[1] / float(colmap_cam.width)
+                        cam.depth_K = colmap_cam.K.copy()
+                        cam.depth_K[0, :] *= sx
+                        cam.depth_K[1, :] *= sy
+
+                    if depth_scales is not None and depth_cfg.rescale:
+                        calib = depth_scales.get(
+                            Path(im.name).name
+                        ) or depth_scales.get(Path(im.name).stem)
+                        if calib is not None:
+                            cam.depth_scale = calib.scale
+                            cam.depth_offset = calib.offset
+
+        cameras.append(cam)
+
+    if missing_images:
+        raise DatasetError(
+            f"{len(missing_images)} image(s) referenced by the COLMAP model were "
+            f"not found under {image_dir}, e.g. {missing_images[:3]}. "
+            "Check data.image_dir, or that the images are where the model says."
+        )
+    if depth_cfg.enabled and missing_depth:
+        frac = missing_depth / max(1, len(cameras))
+        msg = (
+            f"{missing_depth}/{len(cameras)} frames have no depth map under "
+            f"{depth_dir}"
+        )
+        if frac > 0.5:
+            raise DatasetError(
+                msg + " -- more than half are missing, so the depth directory is "
+                "probably wrong or uses a different naming scheme. "
+                "Depth files are matched by frame stem; check one by hand."
+            )
+        notes.append(msg + " (those frames are trained photometrically only)")
+
+    return cameras, sizes
+
+
+# --------------------------------------------------------------------------
+# Split
+# --------------------------------------------------------------------------
+def _split_indices(
+    n: int, cfg: Config
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Return ``(train_idx, val_idx)`` in :meth:`ColmapModel.sorted_images` order."""
+    mode = cfg.data.split_mode
+    if mode == "reconstruction":
+        # Every image is trained on. Held-out evaluation is done on the same
+        # set, so the reported PSNR measures fit. This is what the archived
+        # MatrixCity baselines did; changing it makes their numbers and ours
+        # incomparable, which is why it is an explicit choice rather than a
+        # silent default.
+        return np.arange(n), None
+
+    all_idx = np.arange(n)
+    if cfg.data.test_every and cfg.data.test_every > 0:
+        val_mask = all_idx % cfg.data.test_every == 0
+    else:
+        ratio = float(np.clip(cfg.data.eval_ratio, 0.0, 1.0))
+        if ratio <= 0.0 or ratio >= 1.0:
+            raise DatasetError(
+                f"split_mode='experiment' needs 0 < eval_ratio < 1 "
+                f"(got {cfg.data.eval_ratio}) or a positive test_every"
+            )
+        n_val = max(1, int(round(n * ratio)))
+        # Evenly spaced rather than a random draw: reproducible, and it spreads
+        # held-out views across the whole flight line instead of clustering
+        # them at one end.
+        val_mask = np.zeros(n, dtype=bool)
+        val_mask[np.linspace(0, n - 1, n_val).round().astype(int)] = True
+
+    return all_idx[~val_mask], all_idx[val_mask]
+
+
+# --------------------------------------------------------------------------
+# Initial points
+# --------------------------------------------------------------------------
+def _initial_points(
+    model: ColmapModel,
+    cfg: Config,
+    cameras: Sequence[Camera],
+    *,
+    seed: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """Initial point cloud and colours; also returns provenance notes."""
+    notes: List[str] = []
+    mode = cfg.data.init_points
+
+    if mode == "sparse":
+        pts = model.points_xyz
+        rgb = model.points_rgb.astype(np.float32) / 255.0
+        notes.append(f"init cloud: COLMAP sparse points ({pts.shape[0]})")
+        if pts.shape[0] < 100:
+            notes.append(
+                "WARNING: fewer than 100 sparse points; densification will have "
+                "almost nothing to grow from"
+            )
+    elif mode == "depth":
+        pts, rgb, notes = _dgi_points(cameras, cfg, seed=seed)
+    elif mode == "none":
+        pts = np.zeros((0, 3), np.float64)
+        rgb = np.zeros((0, 3), np.float32)
+        notes.append("init cloud: empty (model starts from noise)")
+    else:  # pragma: no cover - validated earlier
+        raise DatasetError(f"unknown init_points mode {mode!r}")
+
+    cap = cfg.data.max_init_points
+    if cap and pts.shape[0] > cap:
+        rng = np.random.default_rng(seed)
+        keep = rng.choice(pts.shape[0], cap, replace=False)
+        keep.sort()
+        pts, rgb = pts[keep], rgb[keep]
+        notes.append(f"init cloud capped to {cap} points")
+
+    return pts, rgb, notes
+
+
+def _dgi_points(
+    cameras: Sequence[Camera], cfg: Config, *, seed: int = 0
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """Depth-guided initialisation: unproject every valid depth pixel.
+
+    Each frame is unprojected with **its own depth intrinsics**. Using the
+    render intrinsics instead rotates every ray, which is invisible in the
+    point count and only shows up as a cloud that does not quite fit the
+    cameras. Measured ray error at a 10% focal discrepancy grows linearly with
+    distance from the principal point.
+
+    Colours come from the render image at the *normalised* position of each
+    depth sample, because the depth and image grids need not coincide.
+    """
+    from .dgi import DgiConfig, build_dgi_cloud
+
+    dgi = DgiConfig(
+        stride=cfg.data.dgi_stride,
+        border_trim=cfg.data.dgi_border_trim,
+        min_depth=cfg.data.dgi_min_depth,
+        max_depth=cfg.data.dgi_max_depth,
+    )
+    depths, Ks, c2ws, images, scales = [], [], [], [], []
+    used = 0
+    for cam in cameras:
+        if cam.depth_path is None:
+            continue
+        raw = read_depth(cam.depth_path)
+        if raw is None:
+            continue
+        d = raw * cam.depth_scale + cam.depth_offset
+        valid = np.isfinite(d) & (d > 0)
+        if valid.mean() < cfg.data.depth.min_valid_frac:
+            continue
+        depths.append(d)
+        Ks.append(cam.depth_K if cam.depth_K is not None else cam.K)
+        c2ws.append(cam.cam_to_world)
+        scales.append(1.0)  # already applied above
+        try:
+            import imageio.v2 as imageio
+
+            images.append(imageio.imread(str(cam.image_path)))
+        except Exception:
+            images.append(None)
+        used += 1
+
+    if not depths:
+        raise DatasetError(
+            "init_points='depth' needs depth maps, but none were usable. "
+            "Enable data.depth and check data.depth.dir."
+        )
+
+    xyz, rgb = build_dgi_cloud(
+        depths,
+        Ks,
+        c2ws,
+        None if any(im is None for im in images) else images,
+        cfg=dgi,
+        max_points=cfg.data.max_init_points,
+        seed=seed,
+    )
+    notes = [
+        f"init cloud: DGI from {used} depth maps ({xyz.shape[0]} points)",
+        "  each frame unprojected with its own depth-grid intrinsics",
+    ]
+    if any(im is None for im in images):
+        notes.append("  colours defaulted to grey (image read failed)")
+    return xyz, rgb, notes
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+def parse_colmap(cfg: Config) -> Tuple[Split, ParseReport]:
+    """Parse a COLMAP dataset into a train/val :class:`Split`."""
+    root = Path(cfg.data.path)
+    model = read_colmap_model(root)
+
+    image_dir, nominal = resolve_image_dir(
+        root, cfg.data.image_dirs, cfg.data.image_dir
+    )
+    notes: List[str] = []
+    if nominal:
+        notes.append(
+            f"image dir named like a {nominal}x downsample; the real calibration "
+            "is taken from the decoded file size, not the name"
+        )
+
+    depth_scales = None
+    reference_scale = 1.0
+    if cfg.data.depth.enabled and cfg.data.depth.rescale:
+        if not cfg.data.depth.scale_file:
+            raise DatasetError(
+                "depth.rescale=True requires depth.scale_file (a per-frame "
+                "{scale, offset} JSON). Without it there is no calibration to "
+                "apply and the depth would silently stay in arbitrary units."
+            )
+        sf = Path(cfg.data.depth.scale_file)
+        if not sf.is_absolute():
+            sf = root / sf
+        depth_scales = load_depth_scales(sf)
+        reference_scale = median_scale(depth_scales)
+        notes.append(
+            f"depth calibrated from {sf.name}: {len(depth_scales)} frames, "
+            f"median scale {reference_scale:.6g}"
+        )
+
+    cameras, sizes = _build_cameras(
+        model,
+        image_dir,
+        cfg,
+        depth_scales=depth_scales,
+        reference_scale=reference_scale,
+        notes=notes,
+    )
+
+    # Model images may have been dropped (missing files raise, but depth
+    # filtering happens later), so re-align the point indices to the cameras.
+    kept_names = {c.name for c in cameras}
+    if len(cameras) != len(model.images):
+        model = ColmapModel(
+            cameras=model.cameras,
+            images={k: v for k, v in model.images.items() if v.name in kept_names},
+            points_xyz=model.points_xyz,
+            points_rgb=model.points_rgb,
+        )
+
+    points, point_rgb, pt_notes = _initial_points(model, cfg, cameras, seed=cfg.train.seed)
+    notes.extend(pt_notes)
+
+    # Scene stats *before* the gauge, so the scale can be derived from the
+    # source units; then again after, for the trainer.
+    c2ws = np.stack([c.cam_to_world for c in cameras], axis=0)
+
+    depths_for_scale = None
+    if cfg.gauge.scale_source == "depth_p99":
+        depths_for_scale = _sample_depths(cameras)
+
+    sim = None
+    gauge_notes: List[str] = []
+    if cfg.gauge.mode == "normalize":
+        s, s_source = derive_scale(
+            c2ws[:, :3, 3],
+            depths_for_scale,
+            cfg.gauge.scale_source,
+            manual=cfg.gauge.scale,
+            trim=cfg.gauge.trim_quantile,
+        )
+        sim = Sim3(R=np.eye(3), s=s, t=np.zeros(3))
+        gauge_notes.append(f"normalisation scale {s:.6g} from {s_source}")
+    elif cfg.gauge.mode != "none":  # pragma: no cover
+        raise DatasetError(f"unknown gauge.mode {cfg.gauge.mode!r}")
+
+    c2ws, points, _, gauge_app = apply_gauge(
+        cam_to_worlds=c2ws,
+        points=points,
+        depths=None,  # per-frame scaling is carried on Camera.depth_scale
+        sim3=sim,
+        apply_to_depth=cfg.gauge.apply_to_depth,
+        source=cfg.gauge.mode,
+        notes=gauge_notes,
+    )
+    if sim is not None and cfg.gauge.apply_to_depth and not cfg.data.depth.per_frame_median_norm:
+        for cam in cameras:
+            cam.depth_scale *= sim.s
+        gauge_app.applied_to_depth = True
+
+    for cam, c2w in zip(cameras, c2ws):
+        cam.cam_to_world = c2w
+
+    q = depth_quantiles(c2ws, points)
+    cam_ext = camera_extent(c2ws)
+    scene_scale, ss_source = derive_scene_scale(q, cam_ext)
+    notes.append(f"scene_scale {scene_scale:.6g} from {ss_source}")
+
+    scene = Scene(
+        cameras=cameras,
+        points=points,
+        point_rgb=point_rgb,
+        applied_sim3=sim.matrix() if sim is not None else None,
+        camera_extent=cam_ext,
+        scene_scale=scene_scale,
+        depth_p01=q["p01"],
+        depth_p50=q["p50"],
+        depth_p99=q["p99"],
+        notes=notes,
+    )
+
+    train_idx, val_idx = _split_indices(len(cameras), cfg)
+    train = scene_subset(scene, train_idx)
+    val = scene_subset(scene, val_idx) if val_idx is not None and len(val_idx) else None
+
+    if val is not None:
+        # A validation view must not share a camera with training.
+        train_set = {c.name for c in train.cameras}
+        val_set = {c.name for c in val.cameras}
+        assert not (train_set & val_set), "train/val split overlap"
+
+    report = ParseReport(
+        image_dir=str(image_dir),
+        render_sizes=sizes,
+        n_images=len(cameras),
+        n_train=len(train.cameras),
+        n_val=len(val.cameras) if val is not None else 0,
+        n_points=scene.points.shape[0],
+        depth_maps=sum(1 for c in cameras if c.depth_path is not None),
+        depth_remapped=sum(1 for c in cameras if c.depth_grid_differs),
+        gauge=gauge_app,
+        notes=notes,
+    )
+    return Split(train=train, val=val), report
+
+
+def _sample_depths(cameras: Sequence[Camera], max_frames: int = 32) -> Optional[np.ndarray]:
+    """Read a subsample of depth maps, for deriving the normalisation scale."""
+    if not cameras:
+        return None
+    step = max(1, len(cameras) // max_frames)
+    out = []
+    for cam in cameras[::step]:
+        if cam.depth_path is None:
+            continue
+        raw = read_depth(cam.depth_path)
+        if raw is None:
+            continue
+        d = raw * cam.depth_scale + cam.depth_offset
+        d = d[np.isfinite(d) & (d > 0)]
+        if d.size:
+            out.append(d)
+    if not out:
+        return None
+    return np.concatenate(out)
+
+
+# --------------------------------------------------------------------------
+# Rigid multi-source alignment (used by the feed-forward ingest path)
+# --------------------------------------------------------------------------
+def align_to_reference(
+    source_c2ws: np.ndarray,
+    reference_c2ws: np.ndarray,
+    *,
+    max_residual: float = 0.05,
+    source: str = "scal3r",
+    target: str = "colmap",
+) -> Tuple[Sim3, dict]:
+    """Fit and validate the Sim(3) taking ``source`` poses into ``reference``.
+
+    A similarity can always be fitted; the *residual* is what says whether the
+    two trajectories are actually the same scene. Measured on one real pair the
+    residual was 8.6e-8 when the sources shared a gauge and 11.1% when they did
+    not -- six orders of magnitude apart, so the threshold is not delicate.
+
+    ``max_residual`` is normally supplied from ``cfg.gauge.sim3_max_residual``.
+    ``source``/``target`` are recorded on the returned transform so its guarded
+    apply helpers can reject a wrong-side application.
+    """
+    if source_c2ws.shape[0] != reference_c2ws.shape[0]:
+        raise DatasetError(
+            f"align requires matched frames: {source_c2ws.shape[0]} vs "
+            f"{reference_c2ws.shape[0]}"
+        )
+    src_c = source_c2ws[:, :3, 3]
+    ref_c = reference_c2ws[:, :3, 3]
+    sim = estimate_sim3(src_c, ref_c, source=source, target=target)
+    rms, mx = sim3_residual(src_c, ref_c, sim)
+    span = trajectory_span(ref_c)
+    frac = rms / span if span > 0 else float("inf")
+    report = {
+        "scale": sim.s,
+        "rms": rms,
+        "max": mx,
+        "span": span,
+        "residual_fraction": frac,
+        "ok": frac <= max_residual,
+    }
+    if not report["ok"]:
+        raise DatasetError(
+            f"Sim(3) residual {frac:.3%} exceeds the {max_residual:.1%} threshold "
+            f"(rms {rms:.4g} over a trajectory span of {span:.4g}). The two "
+            "trajectories are not the same scene in two gauges -- most often "
+            "because one side is already aligned and the other is raw, or "
+            "because the frame correspondence is wrong."
+        )
+    return sim, report
+
+
+def align_scal3r_to_colmap(
+    scal3r_cam_to_worlds,
+    scal3r_names,
+    colmap_model,
+    cfg: Config,
+) -> Tuple[Sim3, dict]:
+    """Align a Scal3R reconstruction into a COLMAP model's gauge.
+
+    This is the one-line glue the "mixed source" path needs: fit the Sim(3) on
+    matched camera centres, gate it with ``cfg.gauge.sim3_max_residual``, and
+    return the transform to apply to Scal3R poses *and* depth together.
+
+    Frames are matched by name. That is why :mod:`surfel.data.scal3r` resolves
+    Scal3R's zero-padded indices to the original filenames -- with the indices
+    left in place this function matched 0 of 185 garden frames and reported
+    nothing, which is the failure mode it is written to avoid.
+
+    Returns ``(sim3, report)``. ``report`` carries ``scale``/``rms``/
+    ``residual_fraction`` so the caller can log *why* the gate passed.
+    """
+    cmap = {im.name: im for im in colmap_model.sorted_images()}
+    s_index = {n: i for i, n in enumerate(scal3r_names)}
+    common = sorted(set(cmap) & set(s_index))
+    if not common:
+        raise DatasetError(
+            "no frame name overlaps between the Scal3R run and the COLMAP "
+            f"model ({len(s_index)} vs {len(cmap)} frames). Check that the "
+            "Scal3R reader resolved name_map.json: its names must be the "
+            "original filenames, not the zero-padded indices."
+        )
+    src = np.stack([scal3r_cam_to_worlds[s_index[n]][:3, 3] for n in common])
+    ref = np.stack([cmap[n].camera_center for n in common])
+    sim, report = align_to_reference(
+        np.asarray(scal3r_cam_to_worlds)[[s_index[n] for n in common]],
+        np.stack([cmap[n].cam_to_world for n in common]),
+        max_residual=cfg.gauge.sim3_max_residual,
+        source="scal3r",
+        target="colmap",
+    )
+    report["n_matched"] = len(common)
+    report["n_scal3r"] = len(s_index)
+    report["n_colmap"] = len(cmap)
+    report["frames"] = common
+    return sim, report
+
+
+__all__ = [
+    "DatasetError",
+    "ParseReport",
+    "parse_colmap",
+    "align_to_reference",
+    "align_scal3r_to_colmap",
+    "GaugeSource",
+]

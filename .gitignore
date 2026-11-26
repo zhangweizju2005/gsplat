@@ -128,6 +128,12 @@ data
 results
 
 !examples/benchmarks/compression/results/
+# `data` above is unanchored, so it matches every directory named `data` at any
+# depth -- including source packages. That silently kept surfel/data/ (the whole
+# dataset layer: COLMAP IO, gauge, Scal3R, DGI) out of the repository while the
+# 17 files that import it were committed, so a clean clone could not import the
+# package and nothing caught it because local tests read the working tree.
+!surfel/data/
 
 # Generated/shareable HTML preview of the planning markdown — kept locally only.
 planning/*.html
