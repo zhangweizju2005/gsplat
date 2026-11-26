@@ -178,6 +178,38 @@ class Trainer:
                 )
             self._emit(f"mcmc init    : opacity={init_opacity} scale={init_scale}")
 
+        # means LR: resolve the gauge-free form if the config asked for it.
+        #
+        # ``means`` is a length, so a raw value is only meaningful relative to the
+        # scene. ``means_per_spacing`` states the rate in the point cloud's own
+        # units (kNN spacings per step), which is what transfers between scenes;
+        # measured optimum on garden is 0.010-0.030 and GSL's archived MatrixCity
+        # f0_gtpose sits at 0.0104. See LRConfig.means_per_spacing.
+        lr_means_cfg = self.cfg.train.lr.means
+        rel = self.cfg.train.lr.means_per_spacing
+        if rel is not None:
+            from surfel.model.splats import knn_mean_distance_rms
+
+            spacing = float(
+                knn_mean_distance_rms(
+                    torch.as_tensor(scene.points, dtype=torch.float32)
+                ).median()
+            )
+            if not (spacing > 0.0):
+                raise ValueError(
+                    f"measured kNN spacing is {spacing!r}, cannot convert "
+                    "train.lr.means_per_spacing into an absolute learning rate"
+                )
+            # create_splats_2dgs multiplies lr_means by scene_scale again, so
+            # divide it out here to land on exactly rel * spacing.
+            lr_means_cfg = rel * spacing / scene.scene_scale
+            self._emit(
+                f"means lr     : {rel:.4g} spacings/step "
+                f"(kNN {spacing:.4g} x rel / scene_scale "
+                f"{scene.scene_scale:.4g} = {lr_means_cfg:.4g} raw, "
+                f"x scene_scale = {rel * spacing:.4g} absolute)"
+            )
+
         init: SplatInit = create_splats_2dgs(
             scene.points,
             scene.point_rgb,
@@ -186,7 +218,7 @@ class Trainer:
             init_opacity=init_opacity,
             init_scale=init_scale,
             init_scale_mult=self.cfg.model.init_scale_mult,
-            lr_means=self.cfg.train.lr.means * self.cfg.train.spatial_lr_scale,
+            lr_means=lr_means_cfg * self.cfg.train.spatial_lr_scale,
             lr_scales=self.cfg.train.lr.scales,
             lr_quats=self.cfg.train.lr.quats,
             lr_opacities=self.cfg.train.lr.opacities,
@@ -406,12 +438,30 @@ class Trainer:
 
     def _setup_schedule(self) -> None:
         self.means_lr_step = None
-        if self.cfg.train.lr.decay_means and self.cfg.train.lr.means_final:
+        lr_cfg = self.cfg.train.lr
+        if lr_cfg.decay_means:
+            # Resolve the endpoint. ``means_final`` is an absolute alternative for
+            # callers that want a specific value; otherwise use the ratio, which
+            # is the form that transfers (GSL anchors init * 0.01 over its own
+            # step count, and so do we).
+            lr_init = self.optimizers["means"].param_groups[0]["lr"]
+            lr_final = lr_cfg.means_final
+            if lr_final is None:
+                lr_final = lr_init * lr_cfg.means_final_ratio
+            if not (lr_final > 0.0):
+                raise ValueError(
+                    f"resolved means LR endpoint is {lr_final!r}; the schedule "
+                    "needs a positive value"
+                )
             self.means_lr_step = means_lr_scheduler(
                 self.optimizers,
-                lr_init=self.optimizers["means"].param_groups[0]["lr"],
-                lr_final=self.cfg.train.lr.means_final,
+                lr_init=lr_init,
+                lr_final=lr_final,
                 max_steps=self.cfg.train.max_steps,
+            )
+            self._emit(
+                f"means decay  : {lr_init:.4g} -> {lr_final:.4g} "
+                f"(ratio {lr_final / lr_init:.4g}) over {self.cfg.train.max_steps} steps"
             )
 
     # ------------------------------------------------------------------

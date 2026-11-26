@@ -684,3 +684,158 @@ def test_consistency_report_includes_absolute_camera_radius():
     assert "camera_radius" in stats
     assert stats["camera_radius"] > 0
     assert "ok" in stats and "reasons" in stats
+
+
+# ---------------------------------------------------------------------------
+# means learning rate: the gauge-free form, and the decay that never ran
+# ---------------------------------------------------------------------------
+def test_means_per_spacing_overrides_means_and_is_gauge_free():
+    """``train.lr.means_per_spacing`` must land on exactly rel * kNN spacing.
+
+    ``means`` is a length, so its raw value cannot transfer between scenes: Adam's
+    step is ~lr * sign/sqrt(v), dimensionless for log-space parameters but not for
+    ``means``. Measured on garden, the config-derived value is 0.119 kNN
+    spacings/step while GSL's independently tuned MatrixCity run sits at 0.0104,
+    and the difference is worth 2 dB (23.06 vs 25.09). Stating the rate in the
+    point cloud's own units makes the two comparable.
+
+    The assertion is on the *absolute* LR the optimiser ends up with, because that
+    is where two scalings compose: the config value is divided by scene_scale here
+    and multiplied again inside create_splats_2dgs. Getting that double scaling
+    wrong would silently shift the LR by scene_scale^2.
+    """
+    import tempfile
+
+    import torch
+
+    from surfel.config import build_config
+    from surfel.config.profiles import make_profile_config
+    from surfel.data import parse_colmap
+    from surfel.model.splats import knn_mean_distance_rms
+    from surfel.tests.fixtures import make_synthetic_colmap
+    from surfel.train import Trainer
+
+    root = tempfile.mkdtemp(prefix="lrspacing_")
+    make_synthetic_colmap(root, n_frames=8, width=64, height=48)
+
+    cfg = make_profile_config("smoke")
+    cfg.data.path = str(root)
+    cfg.gauge.scale_source = "extent"
+    cfg.data.split_mode = "experiment"
+    cfg.train.max_steps = 2
+    cfg.train.eval_steps = []
+    cfg.train.save_steps = []
+    cfg.train.lr.decay_means = False
+    cfg.train.lr.means_per_spacing = 0.02
+    cfg.train.out_dir = tempfile.mkdtemp(prefix="lrspacing_out_")
+    cfg.validate()
+    split, _ = parse_colmap(cfg)
+
+    tr = Trainer(cfg, split, log_fn=None)
+    realised = tr.optimizers["means"].param_groups[0]["lr"]
+    spacing = float(
+        knn_mean_distance_rms(
+            torch.as_tensor(split.train.points, dtype=torch.float32)
+        ).median()
+    )
+    assert abs(realised - 0.02 * spacing) / (0.02 * spacing) < 1e-3, (
+        f"means_per_spacing 0.02 with spacing {spacing:.5g} should give "
+        f"{0.02 * spacing:.5g}, got {realised:.5g}"
+    )
+
+
+def test_means_decay_ratio_keeps_profiles_working():
+    """``decay_means=True`` used to be a silent no-op in every profile.
+
+    The schedule is only built when a final value exists, and ``means_final``
+    defaulted to None -- so aerial/aerial_long/object all asked for decay and got
+    none, for the entire life of those profiles. The ratio form fixes it without
+    hard-coding 1.6e-6, which is GSL's endpoint after *its* 30000 steps and is not
+    transferable to a 7000-step run.
+    """
+    import pytest as _pytest
+
+    from surfel.config.profiles import make_profile_config
+
+    for name in ("aerial", "aerial_long", "object"):
+        cfg = make_profile_config(name)
+        cfg.data.path = "/tmp/x"
+        cfg.validate()  # must not raise: a profile with decay must be runnable
+        assert cfg.train.lr.decay_means is True
+        assert 0.0 < cfg.train.lr.means_final_ratio < 1.0
+
+    bad = make_profile_config("aerial")
+    bad.data.path = "/tmp/x"
+    bad.train.lr.means_final_ratio = 1.5
+    with _pytest.raises(ValueError, match="means_final_ratio"):
+        bad.validate()
+
+
+def test_means_and_means_per_spacing_together_are_rejected():
+    """Two ways to state the same rate must not both be accepted silently.
+
+    They differ by more than 10x on garden (0.010 vs 0.119 spacings/step), so
+    accepting both and picking one would make a config file read as something it
+    is not.
+    """
+    import pytest as _pytest
+
+    from surfel.config.profiles import make_profile_config
+
+    cfg = make_profile_config("smoke")
+    cfg.data.path = "/tmp/x"
+    cfg.train.lr.means_per_spacing = 0.02
+    cfg.train.lr.means = 1e-5  # non-default: conflicts
+    with _pytest.raises(ValueError, match="means_per_spacing wins"):
+        cfg.validate()
+
+
+def test_means_lr_actually_decays_during_training():
+    """Measure the optimiser's LR before and after, not just the config.
+
+    The previous test only asserts that profiles validate; it passed even with the
+    original bug restored (`if decay_means and means_final:` -- always false),
+    because a config can be valid while the training loop ignores it. This one
+    runs the trainer and reads the parameter group, which is the only place a
+    silently-skipped schedule is visible.
+    """
+    import tempfile
+
+    from surfel.config.profiles import make_profile_config
+    from surfel.data import parse_colmap
+    from surfel.tests.fixtures import make_synthetic_colmap
+    from surfel.train import Trainer
+
+    root = tempfile.mkdtemp(prefix="decay_")
+    make_synthetic_colmap(root, n_frames=8, width=64, height=48)
+
+    cfg = make_profile_config("smoke")
+    cfg.data.path = str(root)
+    cfg.gauge.scale_source = "extent"
+    cfg.data.split_mode = "experiment"
+    cfg.train.max_steps = 30
+    cfg.train.eval_steps = []
+    cfg.train.save_steps = []
+    cfg.train.lr.decay_means = True
+    cfg.train.lr.means_final = None          # exercise the ratio path
+    cfg.train.lr.means_final_ratio = 0.01
+    cfg.out_dir = tempfile.mkdtemp(prefix="decay_out_")
+    cfg.train.out_dir = cfg.out_dir
+    cfg.validate()
+    split, _ = parse_colmap(cfg)
+
+    tr = Trainer(cfg, split, log_fn=None)
+    lr_init = tr.optimizers["means"].param_groups[0]["lr"]
+    tr.fit()
+    lr_end = tr.optimizers["means"].param_groups[0]["lr"]
+
+    assert lr_end < lr_init, (
+        f"means LR did not decay: {lr_init:.4g} -> {lr_end:.4g}. The schedule is "
+        "not being built, which is the silent no-op this test exists to catch."
+    )
+    # 30 of 30 steps under an exponential schedule should approach the ratio.
+    ratio = lr_end / lr_init
+    assert 0.005 < ratio < 0.5, (
+        f"decayed to {ratio:.4g} of the initial LR over the full run; expected "
+        "roughly 0.01 for means_final_ratio=0.01"
+    )

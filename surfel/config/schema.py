@@ -456,10 +456,64 @@ class LRConfig:
     sh0: float = 2.5e-3
     shN: float = 2.5e-3 / 20.0
 
+    #: ``means`` LR expressed in **kNN spacings per step**, which is the only
+    #: form comparable across scenes. When set, it overrides :attr:`means`.
+    #:
+    #: ``means`` is a length, so its raw value is meaningless without the scene
+    #: scale: Adam's step is ~``lr * sign/sqrt(v)``, which is dimensionless for
+    #: log-space parameters (``scales``, ``quats``, ``opacities``, ``sh``) but has
+    #: units of length for ``means``. Only ``means`` therefore needs normalising,
+    #: and the natural normaliser is the point cloud's own resolution -- the kNN
+    #: spacing the initialiser already measured.
+    #:
+    #: Measured on garden 1297x840 (aerial profile otherwise fixed, 7000 steps),
+    #: sweeping only this ratio:
+    #:
+    #: ==========  ==================  ======  ======  ==========  ==========
+    #: rel_step    means_lr            PSNR    SSIM    Gaussians   dup
+    #: ==========  ==================  ======  ======  ==========  ==========
+    #: 0.001       1.34e-6             24.39   0.749   1.18 M      328 k
+    #: 0.003       4.03e-6             24.76   0.770   1.26 M      345 k
+    #: 0.010       1.34e-5             24.92   0.783   1.35 M      389 k
+    #: 0.030       4.03e-5             25.09   0.783   1.46 M      564 k
+    #: 0.100       1.34e-4             23.06   0.617   1.67 M      979 k
+    #: ==========  ==================  ======  ======  ==========  ==========
+    #:
+    #: The peak is 0.010-0.030, and 0.010 is where GSL's archived MatrixCity
+    #: f0_gtpose sits (8.0e-3 m/step over a 0.772 kNN spacing = 0.0104) -- the
+    #: two independently tuned configurations agree once the gauge is factored
+    #: out. The default-derived value without this field is 0.119, i.e. past the
+    #: edge: it lands in the 0.1 row, which loses 2 dB and 0.17 SSIM while
+    #: nearly tripling duplication.
+    #:
+    #: A second, online signal that the value is too large: split/dup falls from
+    #: 0.137 at 0.001 to 0.026 at 0.1. Fast-moving centres get pushed into
+    #: high-gradient regions where their footprint shrinks, so they can only
+    #: duplicate. No external metric is needed to notice this.
+    #:
+    #: ``None`` keeps :attr:`means` as-is, so existing configs are unaffected.
+    means_per_spacing: Optional[float] = None
+
     #: Exponential decay of ``means`` toward ``means_final`` by ``max_steps``.
     #: The official gsplat trainer does not decay; the archived project recipes
     #: do (1.6e-4 -> 1.6e-6). Profiles decide.
+    #:
+    #: Note ``decay_means`` alone does nothing: the schedule only runs when a
+    #: final value is available.
     decay_means: bool = False
+
+    #: Final ``means`` LR as a **fraction** of the initial one, used when
+    #: :attr:`decay_means` is set and :attr:`means_final` is not.
+    #:
+    #: 0.01 is the ratio every archived GSL recipe uses (1.6e-6 / 1.6e-4), and
+    #: it is the same endpoint gsplat's own 2DGS example reaches via
+    #: ``ExponentialLR(gamma=0.01**(1/max_steps))``. The absolute final value is
+    #: NOT transferable -- 1.6e-6 is the endpoint after GSL's 30000 steps, while
+    #: this project's aerial profile runs 7000 -- but the ratio is, because both
+    #: anchor the same ``init * ratio`` endpoint. A ratio is also the only form
+    #: that survives :attr:`means_per_spacing`, where the initial LR is derived
+    #: from the scene rather than configured.
+    means_final_ratio: float = 0.01
 
 
 @dataclass
@@ -514,6 +568,31 @@ class TrainConfig:
             raise ValueError("train.batch_size must be >= 1")
         if self.pose_opt and self.spatial_lr_scale <= 0:
             raise ValueError("pose_opt requires a positive spatial_lr_scale")
+        if self.lr.means_per_spacing is not None:
+            if self.lr.means_per_spacing <= 0:
+                raise ValueError(
+                    "train.lr.means_per_spacing must be positive, got "
+                    f"{self.lr.means_per_spacing}"
+                )
+            # Both fields set is not necessarily a mistake -- a caller may set
+            # means as documentation and means_per_spacing as the operative
+            # value -- but it is worth warning, because the raw one is silently
+            # ignored and the two give very different step sizes (0.010 vs 0.119
+            # spacings/step on garden, which is 2 dB).
+            if self.lr.means != LRConfig.means:
+                raise ValueError(
+                    f"train.lr.means ({self.lr.means}) and "
+                    f"train.lr.means_per_spacing ({self.lr.means_per_spacing}) "
+                    "are both set; means_per_spacing wins and means is ignored. "
+                    "Remove train.lr.means to make the intent explicit."
+                )
+        if self.lr.decay_means and self.lr.means_final is None:
+            if not (0.0 < self.lr.means_final_ratio < 1.0):
+                raise ValueError(
+                    "train.lr.means_final_ratio must be in (0, 1) when "
+                    "train.lr.decay_means=True and train.lr.means_final is "
+                    f"unset, got {self.lr.means_final_ratio}"
+                )
 
 
 # --------------------------------------------------------------------------
