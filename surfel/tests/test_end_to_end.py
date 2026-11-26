@@ -839,3 +839,40 @@ def test_means_lr_actually_decays_during_training():
         f"decayed to {ratio:.4g} of the initial LR over the full run; expected "
         "roughly 0.01 for means_final_ratio=0.01"
     )
+
+
+def test_aerial_profile_encodes_the_measured_best_arm():
+    """Pin the profile to the values a measurement actually selected.
+
+    The 25.685 dB garden arm was assembled from explicit CLI overrides. A profile
+    that does not embed those values would make "aerial" a name for something
+    nobody measured -- and would silently reintroduce whichever defaults happen
+    to be in the dataclasses.
+
+    The two values that matter are recorded here with their measurements so a
+    future edit has to confront the evidence:
+
+      * means_per_spacing 0.01: 24.92 dB at this rel_step in the sweep, and the
+        point where GSL's f0_gtpose also sits. The absolute default (1.6e-4) is
+        0.119 spacings/step, which measured 22.52 dB.
+      * grow_grad2d 2e-4 / grow_scale3d 0.003: at the corrected LR these beat the
+        archived GSL values 6e-4 / 0.01 by 0.67 dB (25.685 vs 25.013). With the
+        wrong LR they were indistinguishable (22.52 vs 22.744), which is why the
+        earlier §14.5 conclusion read the threshold as the problem.
+
+    footprint_compensate must stay False: it was tried and is counterproductive
+    once the LR is right.
+    """
+    from surfel.config.profiles import make_profile_config
+
+    cfg = make_profile_config("aerial")
+    cfg.data.path = "/tmp/x"
+    cfg.validate()
+
+    assert cfg.train.lr.means_per_spacing == 0.01
+    assert cfg.density.grow_grad2d == 2e-4
+    assert cfg.density.grow_scale3d == 0.003
+    assert cfg.density.footprint_compensate is False
+    # Decay must be configured so it actually runs.
+    assert cfg.train.lr.decay_means is True
+    assert 0.0 < cfg.train.lr.means_final_ratio < 1.0

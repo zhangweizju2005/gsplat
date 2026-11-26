@@ -49,14 +49,39 @@ _PROFILES: dict[str, dict[str, object]] = {
         "train.eval_steps": "[7000]",
         "train.save_steps": "[7000]",
         "train.lr.decay_means": True,
+        # The single most consequential value in this profile, measured on
+        # garden 1297x840 over 7000 steps (see SURFEL_2DGS_LARGE_SCENE §14.9):
+        #
+        #   rel_step   PSNR    SSIM
+        #   0.001      24.39   0.749
+        #   0.003      24.76   0.770
+        #   0.010      24.92   0.783
+        #   0.030      25.09   0.783
+        #   0.100      23.06   0.617   <- where the absolute 1.6e-4 lands
+        #
+        # 0.010 is also where GSL's archived MatrixCity f0_gtpose sits (8.0e-3
+        # m/step over a 0.772 kNN spacing); two configurations tuned on different
+        # scenes and different backends agree once the gauge is factored out.
+        #
+        # Expressing it per spacing rather than as an absolute means_lr is what
+        # makes that transfer possible: means is the only one of the five
+        # parameter groups whose LR is dimensionful. Fixing this alone moved
+        # garden 1297 from 22.52 to 25.685 dB (+3.16).
+        "train.lr.means_per_spacing": 0.01,
         "train.spatial_lr_scale": 1.0,
         # Density window covers the whole run: at 7k steps the upstream 15k
         # stop never triggers anyway, but stating it keeps the semantics equal
         # if someone raises max_steps.
         "density.strategy": "default",
         "density.prune_opa": 0.005,
-        "density.grow_grad2d": 0.0006,
-        "density.grow_scale3d": 0.01,
+        # Measured at the corrected LR: 2e-4 / 0.003 scores 0.67 dB HIGHER than
+        # 6e-4 / 0.01 (25.685 vs 25.013), and at the WRONG (10x too large) LR the
+        # threshold made almost no difference either (22.52 vs 22.744). So these
+        # are the values the 25.685 arm used, not the archived GSL ones: with the
+        # learning rate right, a lower threshold densifies usefully instead of
+        # suppressing the symptom of an oversized LR.
+        "density.grow_grad2d": 0.0002,
+        "density.grow_scale3d": 0.003,
         "density.prune_scale3d": 0.1,
         "density.refine_start_iter": 500,
         "density.refine_stop_iter": 7000,
