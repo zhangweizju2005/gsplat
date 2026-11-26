@@ -385,6 +385,15 @@ class DensityConfig:
     #: calibration.
     #:
     #: Off by default so existing numbers stay exactly reproducible.
+    #:
+    #: **Measured to be counterproductive as a workaround, 2026-11-27.** The
+    #: over-threshold rise this option compensates for turned out to be caused by
+    #: an oversized means learning rate, not by the footprint: holding
+    #: ``rel_step`` at 0.010 and comparing thresholds directly, the *uncompensated*
+    #: values scored higher (25.685 dB vs 25.013 dB at 1297x840). Raising the
+    #: thresholds suppresses the symptom (fewer candidates pass) while giving up
+    #: densification capacity. Fix ``train.lr.means_per_spacing`` first; leave this
+    #: off unless a measurement shows otherwise on a new dataset.
     footprint_compensate: bool = False
     #: The footprint, in render pixels, that the configured thresholds were
     #: tuned at. Only its ratio against the measured footprint is used.
