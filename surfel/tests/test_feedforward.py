@@ -16,7 +16,6 @@ from surfel.data.feedforward import (
     FORMAT_ID,
     BundleWriter,
     export_scal3r,
-    export_vggt,
     load_depth_any,
     read_bundle,
     read_opencv_yaml,
@@ -274,40 +273,46 @@ def test_export_scal3r_missing_images_raises(tmp_path: Path, fake_scal3r: Path):
 
 
 # --------------------------------------------------------------------------
-# VGGT adapter
+# VGGT: deliberately unsupported
 # --------------------------------------------------------------------------
-def test_export_vggt_produces_valid_bundle(tmp_path: Path):
-    n, h, w = 3, 12, 16
-    imgs = tmp_path / "imgs"
-    imgs.mkdir()
-    c2ws = _ring_poses(n)
-    ext = np.stack([np.linalg.inv(c)[:3, :4] for c in c2ws])
-    ixt = np.stack([np.array([[50.0, 0, 8], [0, 50.0, 6], [0, 0, 1]])] * n)
-    depth = np.full((n, h, w), 1.5, np.float32)
-    conf = np.full((n, h, w), 0.9, np.float32)
-    npz = tmp_path / "pred.npz"
-    np.savez(npz, extrinsic=ext, intrinsic=ixt, depth=depth, depth_conf=conf)
-    for i in range(n):
-        _real_image(imgs / f"{i:03d}.jpg", size=(16, 12))
+def test_vggt_path_refuses_and_explains_why(tmp_path: Path):
+    """There is no VGGT adapter, and asking for one must say so clearly.
 
-    out = export_vggt(npz, tmp_path / "bundle", imgs, depth_scale=2.0)
-    b = read_bundle(out.parent)
-    assert len(b.names) == n
-    assert b.depth_grid == (w, h)
-    np.testing.assert_allclose(b.load_depth(0), 3.0)  # 1.5 * scale
-    R = b.cam_to_world[0, :3, :3]
-    assert np.abs(R @ R.T - np.eye(3)).max() < 1e-6
+    An adapter used to exist and was removed: it expected an ``.npz`` with raw
+    ``depth``, which VGGT-X never writes. What ``demo_colmap.py`` actually
+    leaves behind is ``1/(depth+eps)`` rescaled to ``[0, 1]`` per frame with the
+    bounds discarded, so the absolute scale is unrecoverable. Building a bundle
+    from those files would have supervised an arbitrarily-scaled quantity while
+    every log line looked normal, which is the failure mode this project treats
+    as its most expensive class -- worse than an outright refusal.
 
+    The old test only ever fed a hand-built npz to the adapter, so it validated
+    the adapter against its own assumption rather than against the front end.
+    """
+    from surfel.data import feedforward_run
 
-def test_export_vggt_rejects_short_image_list(tmp_path: Path):
     imgs = tmp_path / "imgs"
     imgs.mkdir()
     _real_image(imgs / "0.jpg", size=(16, 12))
-    npz = tmp_path / "p.npz"
-    np.savez(npz, extrinsic=np.stack([np.eye(4)[:3, :4]] * 2),
-             intrinsic=np.stack([np.eye(3)] * 2), depth=np.ones((2, 4, 4), np.float32))
-    with pytest.raises(ValueError, match="images for"):
-        export_vggt(npz, tmp_path / "b", imgs)
+
+    with pytest.raises(NotImplementedError, match="not supported"):
+        feedforward_run.run_vggt(imgs, tmp_path / "pred.npz")
+
+    # The message has to name the actual cause and the way forward.
+    try:
+        feedforward_run.run_vggt(imgs, tmp_path / "pred.npz")
+    except NotImplementedError as exc:
+        text = str(exc).lower()
+        assert "inverse depth" in text
+        assert "scal3r" in text
+
+
+def test_no_export_vggt_symbol_is_exported():
+    """A removed adapter must be gone from the public surface, not just unused."""
+    import surfel.data as data_pkg
+
+    assert not hasattr(data_pkg, "export_vggt")
+    assert "export_vggt" not in getattr(data_pkg, "__all__", [])
 
 
 __all__ = []
@@ -520,3 +525,107 @@ def test_init_points_none_message_does_not_recommend_itself():
         "parse_feedforward still recommends init_points='none', which cannot "
         "train"
     )
+
+
+# --------------------------------------------------------------------------
+# Bundle path must honour the same resolution/config knobs as COLMAP
+# --------------------------------------------------------------------------
+def test_bundle_path_honours_data_factor(tmp_path: Path):
+    """``data.factor`` used to be silently ignored on bundle input.
+
+    The bundle path only read ``target_long_edge``, so a run asking for a 2x
+    downscale silently trained at full resolution -- a config that does not
+    describe the run, which is the class of error this project treats as most
+    expensive (a resolution/K mismatch once cost 12 dB, silently). Both paths now
+    go through ``ResolutionPolicy``.
+    """
+    from surfel.data import parse_dataset
+
+    bundle = _minimal_bundle(tmp_path)
+    base = _bundle_cfg(bundle, tmp_path / "a")
+    split_a, report_a = parse_dataset(base)
+    cam_a = split_a.train.cameras[0]
+
+    halved = _bundle_cfg(bundle, tmp_path / "b", **{"data.factor": "2"})
+    split_b, report_b = parse_dataset(halved)
+    cam_b = split_b.train.cameras[0]
+
+    assert (cam_a.width, cam_a.height) == (16, 12)
+    assert (cam_b.width, cam_b.height) == (8, 6), (
+        f"data.factor=2 produced {cam_b.width}x{cam_b.height}, not half of 16x12"
+    )
+    # K must describe the grid actually rendered, not the source grid.
+    assert abs(cam_b.K[0, 0] - cam_a.K[0, 0] / 2.0) < 1e-6
+
+
+def test_bundle_path_honours_target_long_edge_over_factor(tmp_path: Path):
+    """``target_long_edge`` overrides ``factor``, as it does on the COLMAP path."""
+    from surfel.data import parse_dataset
+
+    bundle = _minimal_bundle(tmp_path)
+    cfg = _bundle_cfg(
+        bundle,
+        tmp_path / "out",
+        **{"data.factor": "2", "data.target_long_edge": "8"},
+    )
+    split, _ = parse_dataset(cfg)
+    cam = split.train.cameras[0]
+    assert max(cam.width, cam.height) == 8
+
+
+def test_bundle_path_refuses_image_dir_instead_of_ignoring_it(tmp_path: Path):
+    """A bundle pins image paths, so ``data.image_dir`` cannot be honoured.
+
+    Silently ignoring it made a run whose config said one thing and whose data
+    came from another. The project's rule is to refuse rather than guess.
+    """
+    from surfel.data import parse_dataset
+
+    bundle = _minimal_bundle(tmp_path)
+    cfg = _bundle_cfg(bundle, tmp_path / "out", **{"data.image_dir": "/nope"})
+    with pytest.raises(Exception, match="not used by a feed-forward bundle"):
+        parse_dataset(cfg)
+
+
+def test_scal3r_patterns_cover_uppercase_extensions(tmp_path: Path):
+    """Mip-NeRF 360 ships ``*.JPG``; Scal3R's default patterns are lowercase.
+
+    ``collect_image_paths`` globs the configured patterns from the config file,
+    and ``scal3r.run`` exposes no flag for them, so a folder of uppercase
+    extensions failed with "No images found" while every file was present. The
+    wrapper generates a derived config that inherits the upstream one and adds
+    the extensions actually present -- Scal3R's source stays untouched.
+    """
+    from surfel.data.feedforward_run import _derived_config_for_extensions
+
+    imgs = tmp_path / "images"
+    imgs.mkdir()
+    for i in range(3):
+        _real_image(imgs / f"{i:03d}.JPG", size=(16, 12))
+
+    root = tmp_path / "fake_scal3r"
+    (root / "configs" / "models").mkdir(parents=True)
+    (root / "configs" / "models" / "scal3r.yaml").write_text("model: {}\n")
+
+    derived = _derived_config_for_extensions(root, imgs, tmp_path / "out")
+    assert derived is not None, "uppercase extensions were not detected"
+    text = derived.config_path.read_text(encoding="utf-8")
+    assert "*.JPG" in text
+    # Quoted, because a leading '*' is YAML alias syntax and would not parse.
+    assert "image_patterns: '" in text
+
+
+def test_scal3r_patterns_are_left_alone_for_lowercase_images(tmp_path: Path):
+    """The common case must not generate a config at all."""
+    from surfel.data.feedforward_run import _derived_config_for_extensions
+
+    imgs = tmp_path / "images"
+    imgs.mkdir()
+    for i in range(2):
+        _real_image(imgs / f"{i:03d}.jpg", size=(16, 12))
+
+    root = tmp_path / "fake_scal3r"
+    (root / "configs" / "models").mkdir(parents=True)
+    (root / "configs" / "models" / "scal3r.yaml").write_text("model: {}\n")
+
+    assert _derived_config_for_extensions(root, imgs, tmp_path / "out") is None

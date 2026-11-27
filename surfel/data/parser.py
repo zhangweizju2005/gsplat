@@ -618,6 +618,18 @@ def parse_feedforward(cfg: Config) -> Tuple[Split, ParseReport]:
     from .feedforward import read_bundle
 
     bundle = read_bundle(cfg.data.path)
+    # Both of these are COLMAP-path concepts that a bundle cannot honour, and
+    # silently ignoring either produces a run whose config does not describe it:
+    # `image_dirs` is a search order for locating files named by the SfM model,
+    # while a bundle pins each frame's image path in `frames.json`; and
+    # `init_points="sparse"` needs a points3D cloud this format does not carry.
+    # The project's rule is to refuse rather than guess, so they raise here.
+    if cfg.data.image_dir is not None:
+        raise DatasetError(
+            "data.image_dir is not used by a feed-forward bundle: each frame's "
+            "image path comes from the bundle's frames.json. Edit the manifest, "
+            "or re-export the bundle with the images in place."
+        )
     if not bundle.has_depth and cfg.data.init_points == "depth":
         raise DatasetError(
             "init_points='depth' needs depth maps, but the bundle has none. "
@@ -644,22 +656,30 @@ def parse_feedforward(cfg: Config) -> Tuple[Split, ParseReport]:
     ]
 
     # Render resolution. A bundle's images are whatever the front end was run on,
-    # so `target_long_edge` has to be honoured here too -- otherwise a
-    # bundle-based run and a COLMAP run of the same scene are not comparable, and
-    # PSNR across them would be meaningless (the failure mode this project treats
-    # as its most expensive bug class).
-    render_w, render_h = int(bundle.image_grid[0]), int(bundle.image_grid[1])
-    if cfg.data.target_long_edge is not None:
-        long_edge = max(render_w, render_h)
-        if long_edge > cfg.data.target_long_edge:
-            s = float(cfg.data.target_long_edge) / float(long_edge)
-            render_w = max(1, int(round(render_w * s)))
-            render_h = max(1, int(round(render_h * s)))
-            notes.append(
-                f"  render grid downscaled {bundle.image_grid[0]}x{bundle.image_grid[1]}"
-                f" -> {render_w}x{render_h} (data.target_long_edge="
-                f"{cfg.data.target_long_edge})"
-            )
+    # so the same three knobs the COLMAP path honours must be honoured here too --
+    # otherwise `data.factor` is silently ignored on bundle input and a
+    # bundle-based run cannot be compared with a COLMAP run of the same scene
+    # (the failure mode this project treats as its most expensive bug class).
+    #
+    # ``ResolutionPolicy`` is reused rather than re-implemented: it is where the
+    # `target_long_edge` overrides `factor`, `min_long_edge` floors it, and K is
+    # scaled by the ratio *actually* achieved after rounding. A second copy of
+    # those rules is how the two paths drifted apart in the first place.
+    policy = ResolutionPolicy(
+        factor=cfg.data.factor,
+        target_long_edge=cfg.data.target_long_edge,
+        min_long_edge=cfg.data.min_long_edge,
+    )
+    resolved = policy.resolve(
+        (int(bundle.image_grid[0]), int(bundle.image_grid[1]))
+    )
+    render_w, render_h = resolved.width, resolved.height
+    if (render_w, render_h) != (bundle.image_grid[0], bundle.image_grid[1]):
+        notes.append(
+            f"  render grid {bundle.image_grid[0]}x{bundle.image_grid[1]}"
+            f" -> {render_w}x{render_h} (data.factor={cfg.data.factor}, "
+            f"target_long_edge={cfg.data.target_long_edge})"
+        )
     if cfg.data.min_long_edge and max(render_w, render_h) < cfg.data.min_long_edge:
         raise DatasetError(
             f"render long edge {max(render_w, render_h)} is below "

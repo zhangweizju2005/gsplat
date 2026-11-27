@@ -11,12 +11,32 @@ this project can consume on every machine:
   depths are lost. It also gates ``OPENCV_IO_ENABLE_OPENEXR`` inside
   ``save_image``, i.e. after ``imgcodecs`` has initialised, so the variable
   cannot take effect even where the codec exists.
-* VGGT keeps depth in an in-memory ``np.savez`` payload whose key layout is
-  internal to that repo.
+* VGGT-X (the installed fork) writes no reusable prediction dump at all: poses
+  go straight to COLMAP-format files and depth goes to
+  ``estimated_depths/*.npy`` as **min-max normalised inverse depth**, with the
+  normalisation bounds discarded. Absolute depth therefore cannot be recovered
+  from what it leaves on disk, so there is deliberately no VGGT adapter here --
+  see the note at the end of this docstring.
 
 Rather than patch either upstream, this module defines **one bundle format** and
-two adapters that produce it. Everything downstream (DGI, the COLMAP-free
-dataset path) reads the bundle, so a swap of front end changes nothing else.
+an adapter that produces it. Everything downstream (DGI, the COLMAP-free dataset
+path) reads the bundle, so a swap of front end changes nothing else.
+
+Why there is no ``export_vggt``
+-------------------------------
+An adapter existed and was removed because it could not be correct. It expected
+an ``.npz`` holding ``extrinsic`` / ``intrinsic`` / ``depth`` / ``depth_conf``,
+i.e. raw depth. ``demo_colmap.py`` keeps those arrays in memory and never writes
+them; what it does write is ``1/(depth+eps)`` rescaled to ``[0, 1]`` per frame,
+after which neither the offset nor the scale is stored anywhere. Any adapter
+built on those files would have to invent the mapping, so a run using it would
+look healthy while supervising an arbitrarily-scaled quantity -- worse than an
+obvious failure. Its unit test only ever exercised a hand-built npz, so it could
+not notice.
+
+To support VGGT properly, dump ``predictions['depth']`` and ``pose_enc`` from
+``run_VGGT`` (a few lines, in the fork) and then write an adapter against that.
+Until then ``data.parser=feedforward`` accepts bundles only from Scal3R.
 
 Bundle layout
 -------------
@@ -650,89 +670,6 @@ def export_scal3r(
     return writer.write()
 
 
-def export_vggt(
-    npz_path: str | Path,
-    out_dir: str | Path,
-    image_dir: str | Path,
-    *,
-    depth_scale: float = 1.0,
-    confidence_key: str = "depth_conf",
-    depth_format: str = "exr",
-    notes: Optional[Sequence[str]] = None,
-) -> Path:
-    """Convert a VGGT ``.npz`` prediction dump into a bundle.
-
-    Expected arrays (the layout ``demo_colmap.py`` produces)::
-
-        extrinsic  [N,3,4]  world-to-camera, OpenCV
-        intrinsic  [N,3,3]  pixels of the *prediction* grid
-        depth      [N,H,W]  z-depth in VGGT's normalised gauge
-        depth_conf [N,H,W]  optional
-
-    ``depth_scale`` multiplies depth into the gauge of ``extrinsic``. VGGT's
-    depth is only metric after its own per-frame alignment; passing the global
-    factor here keeps that act explicit instead of hidden in a caller.
-    """
-    data = np.load(Path(npz_path), allow_pickle=False)
-    ext = np.asarray(data["extrinsic"], dtype=np.float64)
-    ixt = np.asarray(data["intrinsic"], dtype=np.float64)
-    depth = np.asarray(data["depth"], dtype=np.float32) if "depth" in data else None
-    conf = np.asarray(data[confidence_key]) if confidence_key in data else None
-    if ext.ndim != 3 or ext.shape[1:] not in ((3, 4), (4, 4)):
-        raise ValueError(f"extrinsic must be [N,3,4] or [N,4,4], got {ext.shape}")
-    if ixt.shape[1:] != (3, 3):
-        raise ValueError(f"intrinsic must be [N,3,3], got {ixt.shape}")
-
-    imgs = sorted(
-        p for p in Path(image_dir).iterdir()
-        if p.suffix.lower() in (".jpg", ".jpeg", ".png")
-    )
-    n = ext.shape[0]
-    if len(imgs) < n:
-        raise ValueError(f"{len(imgs)} images for {n} predictions in {npz_path}")
-
-    from PIL import Image
-
-    with Image.open(imgs[0]) as im:
-        iw, ih = im.size
-
-    writer = BundleWriter(
-        root=Path(out_dir),
-        source="vggt",
-        image_grid=(int(iw), int(ih)),
-        depth_format=depth_format,
-        gauge={
-            "kind": "normalized_depth",
-            "scale": float(depth_scale),
-            "note": (
-                "VGGT depth is normalised inverse depth; depth_scale maps it into "
-                "the extrinsic gauge. Without a per-frame fit this is a global "
-                "approximation -- downstream gauge.mode=normalize absorbs it."
-            ),
-        },
-        notes=list(notes or []),
-    )
-
-    for i in range(n):
-        # extrinsic is world-to-camera: [3,4] (OpenCV) or [4,4] already.
-        if ext.shape[1] == 4:
-            w2c = np.array(ext[i], dtype=np.float64, copy=True)
-        else:
-            w2c = np.eye(4, dtype=np.float64)
-            w2c[:3, :4] = ext[i]
-        c2w = np.linalg.inv(w2c)
-        d = None if depth is None else depth[i] * float(depth_scale)
-        writer.add(
-            name=imgs[i].name,
-            image_src=imgs[i],
-            K=ixt[i],
-            c2w=c2w,
-            depth=d,
-            confidence=None if conf is None else conf[i],
-        )
-    return writer.write()
-
-
 __all__ = [
     "FORMAT_ID",
     "BundleFrame",
@@ -743,5 +680,4 @@ __all__ = [
     "save_depth_npy",
     "load_depth_any",
     "export_scal3r",
-    "export_vggt",
 ]
