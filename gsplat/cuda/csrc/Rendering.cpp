@@ -1810,7 +1810,9 @@ Rasterization2DGSResult rasterization_2dgs(
         ray_transforms                     = projection.ray_transforms;
         normals                            = projection.normals;
         std::vector<int64_t> opacity_shape = batch_shape_with_2dgs(means, {C, N});
-        projected_opacities                = opacities.unsqueeze(batch_ndim).expand(opacity_shape);
+        // expand() broadcasts with stride 0, but the rasterizer's CHECK_INPUT
+        // demands contiguous storage. Materialize the broadcast instead.
+        projected_opacities = opacities.unsqueeze(batch_ndim).expand(opacity_shape).contiguous();
     }
 
     // Gradient accumulator for densification (surfaced via meta["gradient_2dgs"]).

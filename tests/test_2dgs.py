@@ -572,6 +572,217 @@ def test_rasterization_packed_2dgs_pose_grad_large_nnz():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
 @pytest.mark.skipif(not gsplat.has_2dgs(), reason="2DGS support wasn't built")
+@pytest.mark.parametrize("render_mode", ["RGB+D", "RGB+ED"])
+@pytest.mark.parametrize("packed", [True, False])
+def test_rasterization_2dgs_depth_channel_backward(render_mode: str, packed: bool):
+    """Depth-appended render modes must be differentiable.
+
+    When depth is appended to the feature tensor the CUDA forward builds it with
+    ``at::cat({features, depths.unsqueeze(-1)}, -1)``. Autograd therefore hands
+    the projection backward a *strided* view of the depth gradient, which used to
+    trip ``CHECK_INPUT(grad.depths)``. Both 2DGS projection backward entry points
+    now normalize that gradient with ``.contiguous()`` first.
+    """
+    from gsplat.rendering import rasterization_2dgs
+
+    torch.manual_seed(42)
+    N, C, H, W = 200, 2, 32, 32
+    sh_degree = 3
+    K = (sh_degree + 1) ** 2
+
+    means = torch.randn(N, 3, device=device, requires_grad=True)
+    quats = torch.randn(N, 4, device=device, requires_grad=True)
+    scales = torch.rand(N, 3, device=device, requires_grad=True)
+    opacities = (torch.rand(N, device=device) * 0.5).requires_grad_(True)
+    sh_coeffs = torch.randn(N, K, 3, device=device, requires_grad=True)
+
+    viewmats = torch.eye(4, device=device).expand(C, 4, 4).contiguous()
+    viewmats[:, 2, 3] = 4.0
+    Ks = torch.tensor(
+        [[[W, 0.0, W / 2], [0.0, W, H / 2], [0.0, 0.0, 1.0]]], device=device
+    ).expand(C, 3, 3)
+
+    render_colors, *_ = rasterization_2dgs(
+        means=means,
+        quats=quats,
+        scales=scales,
+        opacities=opacities,
+        colors=sh_coeffs,
+        viewmats=viewmats,
+        Ks=Ks,
+        width=W,
+        height=H,
+        sh_degree=sh_degree,
+        packed=packed,
+        render_mode=render_mode,
+    )
+    # colors + one depth channel
+    assert render_colors.shape == (C, H, W, 4)
+
+    # The regression only manifests when the depth column receives gradient, so
+    # drive the backward through the whole tensor (which slices the depth grad
+    # out of the concatenated one).
+    render_colors.sum().backward()
+
+    for name, tensor in (
+        ("means", means),
+        ("quats", quats),
+        ("scales", scales),
+        ("opacities", opacities),
+        ("sh_coeffs", sh_coeffs),
+    ):
+        assert tensor.grad is not None, f"{name} got no gradient"
+        assert torch.isfinite(tensor.grad).all(), f"{name} grad is not finite"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
+@pytest.mark.skipif(not gsplat.has_2dgs(), reason="2DGS support wasn't built")
+def test_projection_2dgs_bwd_accepts_non_contiguous_grad():
+    """The projection backward must normalize strided gradients itself.
+
+    Guards the primitive directly: a caller (or autograd) may legitimately pass a
+    non-contiguous view of ``grad.depths``. The entry point has to call
+    ``.contiguous()`` before ``CHECK_INPUT`` rather than rejecting the layout.
+    """
+    from gsplat.cuda._wrapper import _make_lazy_cuda_func
+
+    torch.manual_seed(42)
+    N, C, W, H = 64, 2, 16, 16
+
+    means = torch.randn(N, 3, device=device)
+    quats = torch.randn(N, 4, device=device)
+    scales = torch.rand(N, 3, device=device) * 0.1
+    viewmats = torch.eye(4, device=device).expand(C, 4, 4).contiguous()
+    viewmats[:, 2, 3] = 4.0
+    Ks = torch.tensor(
+        [[[W, 0.0, W / 2], [0.0, W, H / 2], [0.0, 0.0, 1.0]]], device=device
+    ).expand(C, 3, 3).contiguous()
+
+    radii, means2d, depths, ray_transforms, normals = (
+        gsplat.fully_fused_projection_2dgs(
+            means, quats, scales, viewmats, Ks, W, H, packed=False
+        )
+    )
+
+    # Build a genuinely non-contiguous depth gradient (stride 2 in the last dim).
+    grad_depths = torch.randn(C, N, 2, device=device)[..., 0]
+    assert not grad_depths.is_contiguous()
+
+    result = _make_lazy_cuda_func("projection_2dgs_fused_bwd")(
+        means,
+        quats,
+        scales,
+        viewmats,
+        Ks,
+        W,
+        H,
+        radii,
+        ray_transforms,
+        torch.zeros_like(means2d),
+        grad_depths,
+        torch.zeros_like(normals),
+        torch.zeros_like(ray_transforms),
+        False,
+    )
+    v_means, v_quats, v_scales = result[0], result[1], result[2]
+    assert torch.isfinite(v_means).all()
+    assert torch.isfinite(v_quats).all()
+    assert torch.isfinite(v_scales).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
+@pytest.mark.skipif(not gsplat.has_2dgs(), reason="2DGS support wasn't built")
+def test_projection_2dgs_packed_bwd_accepts_non_contiguous_grad():
+    """Same guard for the *packed* backward entry point.
+
+    The packed and fused paths list their gradient arguments in a different
+    order (fused: means2d, depths, normals, ray_transforms; packed: means2d,
+    depths, ray_transforms, normals), so they need separate coverage: a fix
+    applied to the wrong argument would still produce finite gradients here but
+    silently swap the normal and ray-transform contributions.
+    """
+    from gsplat.cuda._wrapper import _make_lazy_cuda_func
+
+    torch.manual_seed(42)
+    N, C, W, H = 64, 2, 16, 16
+
+    means = torch.randn(N, 3, device=device)
+    quats = torch.randn(N, 4, device=device)
+    scales = torch.rand(N, 3, device=device) * 0.1
+    viewmats = torch.eye(4, device=device).expand(C, 4, 4).contiguous()
+    viewmats[:, 2, 3] = 4.0
+    Ks = torch.tensor(
+        [[[W, 0.0, W / 2], [0.0, W, H / 2], [0.0, 0.0, 1.0]]], device=device
+    ).expand(C, 3, 3).contiguous()
+
+    # Packed projection returns the per-intersection tensors. Field order is
+    # fixed by Projection2DGSPackedResult (Projection.h:63-74):
+    #   batch_ids, camera_ids, gaussian_ids, indptr,
+    #   radii, means2d, depths, ray_transforms, normals
+    (
+        batch_ids,
+        camera_ids,
+        gaussian_ids,
+        indptr,
+        radii,
+        means2d,
+        depths,
+        ray_transforms,
+        normals,
+    ) = gsplat.fully_fused_projection_2dgs(
+        means, quats, scales, viewmats, Ks, W, H, packed=True
+    )
+
+    nnz = means2d.shape[0]
+    if nnz == 0:
+        pytest.skip("no gaussian intersects the view; nothing to differentiate")
+
+    # Genuinely non-contiguous gradient views for the two depth-related slots.
+    grad_means2d = torch.randn(nnz, 4, device=device)[:, :2]
+    grad_depths = torch.randn(nnz, 2, device=device)[..., 0]
+    grad_normals = torch.randn(nnz, 6, device=device)[:, :3]
+    grad_ray_transforms = torch.randn(nnz, 5, 3, device=device)[:, :4, :]
+    for name, g in (
+        ("means2d", grad_means2d),
+        ("depths", grad_depths),
+        ("normals", grad_normals),
+        ("ray_transforms", grad_ray_transforms),
+    ):
+        assert not g.is_contiguous(), f"{name} fixture is contiguous; test is vacuous"
+
+    # Argument order mirrors RegisterProjection2DGSPacked.backward
+    # (_wrapper.py:2873-2905): sparse_grad comes right after height, before the
+    # per-intersection ids; the gradient slots are ordered
+    # means2d, depths, ray_transforms, normals (note ray_transforms *before*
+    # normals, unlike the fused entry point); and the op ends with the
+    # viewmats_requires_grad flag.
+    result = _make_lazy_cuda_func("projection_2dgs_packed_bwd")(
+        means,
+        quats,
+        scales,
+        viewmats,
+        Ks,
+        W,
+        H,
+        False,  # sparse_grad
+        batch_ids,
+        camera_ids,
+        gaussian_ids,
+        ray_transforms,
+        grad_means2d,
+        grad_depths,
+        grad_ray_transforms,
+        grad_normals,
+        False,  # viewmats_requires_grad
+    )
+    v_means, v_quats, v_scales = result[0], result[1], result[2]
+    assert torch.isfinite(v_means).all()
+    assert torch.isfinite(v_quats).all()
+    assert torch.isfinite(v_scales).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
+@pytest.mark.skipif(not gsplat.has_2dgs(), reason="2DGS support wasn't built")
 def test_rasterize_to_pixels_2dgs_masked_tile_outputs_initialized():
     # A masked-out tile takes the forward rasterizer's early-return branch,
     # which must initialize ALL of its pixel outputs (the binding allocates
