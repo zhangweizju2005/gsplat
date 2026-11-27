@@ -629,3 +629,28 @@ def test_scal3r_patterns_are_left_alone_for_lowercase_images(tmp_path: Path):
     (root / "configs" / "models" / "scal3r.yaml").write_text("model: {}\n")
 
     assert _derived_config_for_extensions(root, imgs, tmp_path / "out") is None
+
+
+def test_render_sizes_use_width_first_on_both_parsers(tmp_path: Path):
+    """``ParseReport.render_sizes`` must mean one thing regardless of parser.
+
+    The bundle path built it as ``(height, width)`` while the COLMAP path used
+    ``(width, height)``, so a manifest could not be read without knowing which
+    parser had produced it -- and both were printed to the console as a bare
+    tuple. The field is documented as width-first now, matching ``Camera.width``
+    and COLMAP's own ``cameras.txt``.
+    """
+    from surfel.data import parse_dataset
+
+    bundle = _minimal_bundle(tmp_path)
+    cfg = _bundle_cfg(bundle, tmp_path / "out")
+    split, report = parse_dataset(cfg)
+    cam = split.train.cameras[0]
+
+    w, h = report.render_sizes[0]
+    assert (w, h) == (cam.width, cam.height), (
+        f"report says {w}x{h} but the camera renders {cam.width}x{cam.height}"
+    )
+    # The fixture is deliberately non-square, so a transposition cannot pass.
+    assert w != h
+    assert report.render_size_labels() == f"{w}x{h}"

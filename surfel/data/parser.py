@@ -65,6 +65,12 @@ class ParseReport:
     """What the parser decided, for the run manifest."""
 
     image_dir: str
+    #: Distinct render grids as ``(width, height)`` -- image convention, like
+    #: ``Camera.width``/``height`` and COLMAP's ``cameras.txt``. The bundle path
+    #: once built this as ``(height, width)``, so the same field meant different
+    #: things depending on which parser produced it and a manifest could not be
+    #: read without knowing that. Printers use :meth:`render_size_labels`, which
+    #: states the unit, so a reader never has to guess.
     render_sizes: List[Tuple[int, int]]
     n_images: int
     n_train: int
@@ -78,7 +84,7 @@ class ParseReport:
     def describe(self) -> str:
         lines = [
             f"image dir    : {self.image_dir}",
-            f"render sizes : {self.render_sizes}",
+            f"render sizes : {self.render_size_labels()}",
             f"images       : {self.n_images} (train {self.n_train} / val {self.n_val})",
             f"init points  : {self.n_points}",
             f"depth maps   : {self.depth_maps}/{self.n_images}"
@@ -92,6 +98,12 @@ class ParseReport:
             lines.append(self.gauge.describe())
         lines.extend(f"note         : {n}" for n in self.notes)
         return "\n".join(lines)
+
+    def render_size_labels(self) -> str:
+        """Render grids as ``WxH`` strings, so the unit is never ambiguous."""
+        if not self.render_sizes:
+            return "?"
+        return ", ".join(f"{w}x{h}" for w, h in self.render_sizes)
 
 
 # --------------------------------------------------------------------------
@@ -727,7 +739,7 @@ def parse_feedforward(cfg: Config) -> Tuple[Split, ParseReport]:
             )
         )
 
-    sizes = {(c.height, c.width) for c in cameras}
+    sizes = {(c.width, c.height) for c in cameras}
     if len(sizes) != 1:
         raise DatasetError(
             f"bundle has {len(sizes)} distinct image sizes {sorted(sizes)}; "

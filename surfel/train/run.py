@@ -376,7 +376,14 @@ def _report_to_dict(report: Any) -> Optional[Dict[str, Any]]:
 
 def _print_summary(cfg: Config, report: Any, manifest: Path) -> None:
     """Human-readable echo of the resolved run, before any GPU work."""
-    sizes = getattr(report, "render_sizes", None)
+    # ``render_sizes`` used to be printed as a raw list of tuples, so nothing on
+    # screen said whether ``(1297, 840)`` was width-first or height-first -- and
+    # the two parsers disagreed about that. The report owns the formatting now.
+    if hasattr(report, "render_size_labels"):
+        sizes = report.render_size_labels()
+    else:  # pragma: no cover - a report from an older/foreign caller
+        raw = getattr(report, "render_sizes", None)
+        sizes = str(raw) if raw else "?"
     print("=" * 72)
     print(f"profile      : {cfg.profile or '(none)'}")
     print(f"dataset      : {cfg.data.path}")
@@ -386,7 +393,7 @@ def _print_summary(cfg: Config, report: Any, manifest: Path) -> None:
         f"{getattr(report, 'n_images', '?')} "
         f"({getattr(report, 'n_train', '?')} train / {getattr(report, 'n_val', '?')} val)"
     )
-    print(f"render sizes : {sizes if sizes else '?'}")
+    print(f"render sizes : {sizes}")
     print(f"points       : {getattr(report, 'n_points', '?')}")
     print(f"depth maps   : {getattr(report, 'depth_maps', 0)}")
     print(
