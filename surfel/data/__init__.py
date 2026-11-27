@@ -22,6 +22,16 @@ from .depth import (
     scale_K_2d,
 )
 from .dgi import DgiConfig, build_dgi_cloud, filter_cloud_by_extent, unproject_depth
+from .feedforward import (
+    BundleWriter,
+    LoadedBundle,
+    export_scal3r,
+    export_vggt,
+    load_depth_any,
+    read_bundle,
+    read_opencv_yaml,
+    save_depth_npy,
+)
 from .gauge import (
     Gauge,
     GaugeApplication,
@@ -47,6 +57,8 @@ from .parser import (
     align_scal3r_to_colmap,
     align_to_reference,
     parse_colmap,
+    parse_dataset,
+    parse_feedforward,
 )
 from .resolution import (
     ResolutionPolicy,
@@ -104,10 +116,21 @@ __all__ = [
     "projected_footprint_px",
     # parser
     "parse_colmap",
+    "parse_feedforward",
+    "parse_dataset",
     "ParseReport",
     "DatasetError",
     "align_to_reference",
     "align_scal3r_to_colmap",
+    # feedforward bundle
+    "BundleWriter",
+    "LoadedBundle",
+    "read_bundle",
+    "export_scal3r",
+    "export_vggt",
+    "save_depth_npy",
+    "load_depth_any",
+    "read_opencv_yaml",
     # resolution
     "ResolutionPolicy",
     "ResolvedResolution",

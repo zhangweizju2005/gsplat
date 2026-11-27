@@ -108,7 +108,11 @@ def test_fixture_depth_range_is_bounded(dataset: Path):
     """Grazing rays must not set the depth range via horizon intersections."""
     from surfel.data import read_depth
 
-    dep = read_depth(dataset / "depths" / "000000.exr")
+    # Look the file up rather than hard-coding a suffix: the fixture writes .npy
+    # by default because some OpenCV wheels cannot write EXR.
+    dep_file = next((dataset / "depths").glob("000000.*"))
+    dep = read_depth(dep_file)
+    assert dep is not None, f"{dep_file} did not read as depth"
     pos = dep[dep > 0]
     assert pos.size > 0
     # Measured 51.8 max before the finite-patch clip was added.

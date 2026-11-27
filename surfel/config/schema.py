@@ -95,8 +95,10 @@ class DepthConfig:
 class DataConfig:
     """Where the scene comes from."""
 
-    #: "colmap" (a COLMAP model dir, optionally with depth) or "transforms".
-    parser: Literal["colmap", "transforms"] = "colmap"
+    #: "colmap" (a COLMAP model dir, optionally with depth) or "feedforward"
+    #: (a ``surfel-feedforward/1`` bundle: poses + depth from Scal3R/VGGT/etc,
+    #: no SfM model). "transforms" is reserved for a NeRF-style JSON source.
+    parser: Literal["colmap", "transforms", "feedforward"] = "colmap"
     path: str = ""
 
     #: "reconstruction" trains on every image, "experiment" holds out a split.

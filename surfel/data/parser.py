@@ -78,7 +78,7 @@ class ParseReport:
     def describe(self) -> str:
         lines = [
             f"image dir    : {self.image_dir}",
-            f"render sizes : {sorted(set(self.render_sizes))}",
+            f"render sizes : {self.render_sizes}",
             f"images       : {self.n_images} (train {self.n_train} / val {self.n_val})",
             f"init points  : {self.n_points}",
             f"depth maps   : {self.depth_maps}/{self.n_images}"
@@ -506,7 +506,7 @@ def parse_colmap(cfg: Config) -> Tuple[Split, ParseReport]:
 
     report = ParseReport(
         image_dir=str(image_dir),
-        render_sizes=sizes,
+        render_sizes=sorted(set(sizes)),  # per-frame list -> distinct grids
         n_images=len(cameras),
         n_train=len(train.cameras),
         n_val=len(val.cameras) if val is not None else 0,
@@ -592,6 +592,279 @@ def align_to_reference(
     return sim, report
 
 
+# --------------------------------------------------------------------------
+# Feed-forward bundle parser
+# --------------------------------------------------------------------------
+def parse_feedforward(cfg: Config) -> Tuple[Split, ParseReport]:
+    """Parse a ``surfel-feedforward/1`` bundle into a train/val :class:`Split`.
+
+    A bundle already carries poses, per-frame intrinsics and (optionally) depth,
+    so this path skips SfM entirely: there is no COLMAP model, no triangulated
+    cloud, and the initial points come from DGI over the bundle's own depth.
+
+    Two invariants are enforced here rather than downstream:
+
+    * **K belongs to the depth grid.** The bundle states ``depth_grid``
+      separately from ``image_grid``; each :class:`Camera` therefore carries
+      ``depth_K``/``depth_hw`` so DGI unprojects with the right intrinsics and
+      depth supervision knows the grids differ.
+    * **Nothing assumes the two grids match.** Colour lookup during DGI goes
+      through normalised coordinates.
+
+    ``data.init_points`` still gates the cloud: ``"depth"`` uses DGI,
+    ``"none"`` starts from an empty cloud, and ``"sparse"`` is refused because a
+    bundle has no sparse points.
+    """
+    from .feedforward import read_bundle
+
+    bundle = read_bundle(cfg.data.path)
+    if not bundle.has_depth and cfg.data.init_points == "depth":
+        raise DatasetError(
+            "init_points='depth' needs depth maps, but the bundle has none. "
+            "Re-export with depths, or set data.init_points=none."
+        )
+    if cfg.data.init_points == "sparse":
+        raise DatasetError(
+            "init_points='sparse' needs a COLMAP points3D cloud; a feed-forward "
+            "bundle has none. Use init_points='depth' (DGI) or 'none'."
+        )
+
+    notes: List[str] = [
+        f"bundle: {bundle.root} (format {bundle.manifest.get('format')})",
+        f"  source={bundle.manifest.get('source')} "
+        f"images={bundle.image_grid[0]}x{bundle.image_grid[1]}"
+        + (
+            f" depth={bundle.depth_grid[0]}x{bundle.depth_grid[1]}"
+            if bundle.depth_grid
+            else " depth=none"
+        ),
+        "  poses are camera-to-world, OpenCV convention; no SfM model was read",
+    ]
+
+    # Render resolution. A bundle's images are whatever the front end was run on,
+    # so `target_long_edge` has to be honoured here too -- otherwise a
+    # bundle-based run and a COLMAP run of the same scene are not comparable, and
+    # PSNR across them would be meaningless (the failure mode this project treats
+    # as its most expensive bug class).
+    render_w, render_h = int(bundle.image_grid[0]), int(bundle.image_grid[1])
+    if cfg.data.target_long_edge is not None:
+        long_edge = max(render_w, render_h)
+        if long_edge > cfg.data.target_long_edge:
+            s = float(cfg.data.target_long_edge) / float(long_edge)
+            render_w = max(1, int(round(render_w * s)))
+            render_h = max(1, int(round(render_h * s)))
+            notes.append(
+                f"  render grid downscaled {bundle.image_grid[0]}x{bundle.image_grid[1]}"
+                f" -> {render_w}x{render_h} (data.target_long_edge="
+                f"{cfg.data.target_long_edge})"
+            )
+    if cfg.data.min_long_edge and max(render_w, render_h) < cfg.data.min_long_edge:
+        raise DatasetError(
+            f"render long edge {max(render_w, render_h)} is below "
+            f"data.min_long_edge={cfg.data.min_long_edge}"
+        )
+
+    def _render_K(K_depth: np.ndarray) -> np.ndarray:
+        """Depth-grid K -> render-grid K, in one isotropic step when possible."""
+        if bundle.depth_grid is None:
+            # No depth: K is authored on the image grid, so scale image->render.
+            sx = render_w / float(bundle.image_grid[0])
+            sy = render_h / float(bundle.image_grid[1])
+            out = np.array(K_depth, dtype=np.float64, copy=True)
+            out[0, :] *= sx
+            out[1, :] *= sy
+            return out
+        return _scale_K_to_grid(
+            K_depth,
+            bundle.depth_grid,
+            (render_w, render_h),
+            notes=notes,
+            name="render",
+        )
+
+    cameras: List[Camera] = []
+    for i, name in enumerate(bundle.names):
+        K = bundle.Ks[i]
+        dgrid = bundle.depth_grid
+        depth_path = bundle.depth_paths[i]
+        cameras.append(
+            Camera(
+                name=name,
+                image_path=bundle.image_paths[i],
+                # Render grid may be smaller than the file on disk; the dataset
+                # resizes on read, and K must describe the grid it renders.
+                K=_render_K(K),
+                width=render_w,
+                height=render_h,
+                cam_to_world=np.asarray(bundle.cam_to_world[i], dtype=np.float64),
+                depth_K=np.asarray(K, dtype=np.float64),
+                depth_hw=None if dgrid is None else (int(dgrid[1]), int(dgrid[0])),
+                depth_path=None if depth_path is None else Path(depth_path),
+                depth_scale=float(bundle.depth_scales[i]),
+                index=i,
+            )
+        )
+
+    sizes = {(c.height, c.width) for c in cameras}
+    if len(sizes) != 1:
+        raise DatasetError(
+            f"bundle has {len(sizes)} distinct image sizes {sorted(sizes)}; "
+            "re-export at a single resolution"
+        )
+
+    c2ws = np.stack([c.cam_to_world for c in cameras], axis=0)
+
+    # Gauge: a bundle is defined up to a similarity. Whether to normalise it, and
+    # from which statistic, is the config's decision -- not this function's.
+    depth_sample = None
+    if cfg.gauge.scale_source == "depth_p99" and bundle.has_depth:
+        chunks = []
+        step = max(1, len(cameras) // 32)
+        for i in range(0, len(cameras), step):
+            d = bundle.load_depth(i)
+            if d is None:
+                continue
+            v = d.ravel() * bundle.depth_scales[i]
+            chunks.append(v[np.isfinite(v) & (v > 0)])
+        if chunks:
+            depth_sample = np.concatenate(chunks)
+
+    sim = None
+    gauge_notes: List[str] = []
+    if cfg.gauge.mode == "normalize":
+        s, s_source = derive_scale(
+            c2ws[:, :3, 3],
+            depth_sample,
+            cfg.gauge.scale_source,
+            manual=cfg.gauge.scale,
+            trim=cfg.gauge.trim_quantile,
+        )
+        sim = Sim3(R=np.eye(3), s=s, t=np.zeros(3))
+        gauge_notes.append(f"normalisation scale {s:.6g} from {s_source}")
+    elif cfg.gauge.mode != "none":
+        raise DatasetError(f"unknown gauge.mode {cfg.gauge.mode!r}")
+
+    # Poses-only gauge step: points do not exist yet (DGI runs below, after the
+    # similarity is known, so the cloud is built directly in the final gauge).
+    gauge_app = None
+    if sim is not None:
+        c2ws_g, _, _, gauge_app = apply_gauge(
+            cam_to_worlds=c2ws,
+            points=np.zeros((0, 3), np.float32),
+            depths=None,
+            sim3=sim,
+            apply_to_depth=cfg.gauge.apply_to_depth,
+            source=cfg.gauge.mode,
+            notes=gauge_notes,
+        )
+        for cam, c2w in zip(cameras, c2ws_g):
+            cam.cam_to_world = c2w
+        if cfg.gauge.apply_to_depth:
+            # The per-frame depth_scale is where depth carries the gauge.
+            for cam in cameras:
+                cam.depth_scale *= sim.s
+            gauge_app.applied_to_depth = True
+    notes.extend(gauge_notes)
+
+    # Initial cloud. DGI runs *after* the gauge so the cloud inherits the same
+    # similarity as the poses and the per-frame depth_scale; doing it before
+    # would leave points and cameras in two different frames.
+    mode = cfg.data.init_points
+    if mode == "depth":
+        pts, rgb, dgi_notes = _dgi_points(cameras, cfg, seed=cfg.train.seed)
+        notes.extend(dgi_notes)
+    elif mode == "none":
+        pts = np.zeros((0, 3), np.float32)
+        rgb = np.zeros((0, 3), np.float32)
+        notes.append("init cloud: empty (no points; densification has no seed)")
+    else:  # pragma: no cover - refused above
+        raise DatasetError(f"unknown init_points mode {mode!r}")
+
+    final_c2ws = np.stack([c.cam_to_world for c in cameras], axis=0)
+    q = depth_quantiles(final_c2ws, pts)
+    cam_ext = camera_extent(final_c2ws)
+    scene_scale, ss_source = derive_scene_scale(q, cam_ext)
+    notes.append(f"scene_scale {scene_scale:.6g} from {ss_source}")
+
+    scene = Scene(
+        cameras=cameras,
+        points=pts,
+        point_rgb=rgb,
+        applied_sim3=sim.matrix() if sim is not None else None,
+        camera_extent=cam_ext,
+        scene_scale=scene_scale,
+        depth_p01=q["p01"],
+        depth_p50=q["p50"],
+        depth_p99=q["p99"],
+        notes=notes,
+    )
+
+    train_idx, val_idx = _split_indices(len(cameras), cfg)
+    train = scene_subset(scene, train_idx)
+    val = scene_subset(scene, val_idx) if val_idx is not None and len(val_idx) else None
+    if val is not None:
+        assert not ({c.name for c in train.cameras} & {c.name for c in val.cameras})
+
+    report = ParseReport(
+        image_dir=str(bundle.root / "images"),
+        render_sizes=sorted(set(sizes)),  # per-frame list -> distinct grids
+        n_images=len(cameras),
+        n_train=len(train.cameras),
+        n_val=len(val.cameras) if val is not None else 0,
+        n_points=scene.points.shape[0],
+        depth_maps=sum(1 for c in cameras if c.depth_path is not None),
+        depth_remapped=0,
+        gauge=gauge_app
+        if gauge_app is not None
+        else GaugeApplication(source=cfg.gauge.mode),
+        notes=notes,
+    )
+    return Split(train=train, val=val), report
+
+
+def _scale_K_to_grid(
+    K: np.ndarray,
+    from_grid: Optional[Tuple[int, int]],
+    to_grid: Tuple[int, int],
+    *,
+    notes: List[str],
+    name: str,
+) -> np.ndarray:
+    """Rescale intrinsics from the depth grid to the image grid.
+
+    Per-axis rather than uniform: the bundle states both grids, so the mapping is
+    defined even when the aspect changed. A non-uniform case is flagged in the
+    notes because it means depth supervision has to remap, not just resize.
+    """
+    if from_grid is None or (int(from_grid[0]), int(from_grid[1])) == (
+        int(to_grid[0]),
+        int(to_grid[1]),
+    ):
+        return np.array(K, dtype=np.float64, copy=True)
+    sx = float(to_grid[0]) / float(from_grid[0])
+    sy = float(to_grid[1]) / float(from_grid[1])
+    if abs(sx - sy) > 1e-3:
+        notes.append(
+            f"  {name}: depth/image aspect differs "
+            f"({from_grid[0]}x{from_grid[1]} -> {to_grid[0]}x{to_grid[1]}); "
+            "K scaled per-axis, depth needs remapping"
+        )
+    out = np.array(K, dtype=np.float64, copy=True)
+    out[0, :] *= sx
+    out[1, :] *= sy
+    return out
+
+
+def parse_dataset(cfg: Config) -> Tuple[Split, ParseReport]:
+    """Dispatch on ``data.parser``: COLMAP model or a feed-forward bundle."""
+    kind = getattr(cfg.data, "parser", "colmap")
+    if kind == "colmap":
+        return parse_colmap(cfg)
+    if kind in ("feedforward", "bundle", "scal3r", "vggt"):
+        return parse_feedforward(cfg)
+    raise DatasetError(f"unknown data.parser {kind!r}; use 'colmap' or 'feedforward'")
+
+
 def align_scal3r_to_colmap(
     scal3r_cam_to_worlds,
     scal3r_names,
@@ -640,6 +913,8 @@ __all__ = [
     "DatasetError",
     "ParseReport",
     "parse_colmap",
+    "parse_feedforward",
+    "parse_dataset",
     "align_to_reference",
     "align_scal3r_to_colmap",
     "GaugeSource",

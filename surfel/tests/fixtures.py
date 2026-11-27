@@ -109,7 +109,7 @@ def make_synthetic_colmap(
     ring_radius: float = 2.6,
     ring_height: float = 1.1,
     focal: float = 150.0,
-    depth_suffix: str = ".exr",
+    depth_suffix: str = ".npy",  # .npy needs no image codec; .exr needs OpenEXR
     with_depth: bool = True,
     plane_half_size: float = 1.6,
     seed: int = 0,
@@ -208,12 +208,17 @@ def make_synthetic_colmap(
 
         if with_depth:
             zbuf = np.where(hit, t, 0.0).astype(np.float32)
-            os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
-            import cv2
+            dep_path = root / "depths" / f"{Path(name).stem}{depth_suffix}"
+            if dep_path.suffix == ".npy":
+                # Exact float32 with no image codec. Some OpenCV wheels ship
+                # without OpenEXR, which made this fixture raise at write time on
+                # such hosts; .npy keeps the fixture portable and lossless.
+                np.save(dep_path, zbuf)
+            else:
+                os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+                import cv2
 
-            cv2.imwrite(
-                str(root / "depths" / f"{Path(name).stem}{depth_suffix}"), zbuf
-            )
+                cv2.imwrite(str(dep_path), zbuf)
 
     # COLMAP sparse points: a regular grid on the same plane. COLMAP ids are
     # 1-based and contiguous. Colours come from the same analytic texture
