@@ -161,6 +161,21 @@ class DataConfig:
             raise ValueError("data.target_long_edge must be positive")
         if self.factor <= 0:
             raise ValueError("data.factor must be positive")
+        if self.init_points == "none":
+            # Kept in the Literal for wire compatibility with configs that
+            # already mention it, but refused here rather than three layers down.
+            # An empty cloud cannot be trained: ``create_splats_2dgs`` rejects it,
+            # there is no kNN spacing for ``means_per_spacing``, and neither
+            # gsplat strategy can grow a model from zero Gaussians
+            # (DefaultStrategy needs candidates to split, MCMC's
+            # n_target = min(cap_max, 1.05 * n) stays 0 when n = 0). Reaching the
+            # trainer with it produced a NaN-spacing ValueError far from the
+            # cause, and the feed-forward parser's own error message used to
+            # recommend it as a fallback.
+            raise ValueError(
+                "data.init_points='none' is not trainable: gsplat cannot grow a "
+                "model from zero Gaussians. Use 'depth' (DGI) or 'sparse'."
+            )
         self.depth.validate()
 
 

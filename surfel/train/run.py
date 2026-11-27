@@ -311,17 +311,25 @@ def write_manifest(
     *,
     args: argparse.Namespace,
     mode: str,
+    path: Optional[Path] = None,
 ) -> Path:
     """Record everything needed to read a metric from this run honestly.
 
     The protocol block (split mode, resolutions, counts) is duplicated from the
     checkpoint on purpose: the manifest is what a human opens, and the trainer's
     own copy only helps a script.
+
+    ``path`` defaults to ``<out_dir>/manifest.json``, i.e. the training record.
+    Non-training modes pass their own name so that re-evaluating a checkpoint
+    cannot overwrite the record of the run that produced it.
     """
     manifest = {
         "mode": mode,
         "profile": cfg.profile,
-        "argv": sys.argv[1:],
+        # The *actual* arguments, not ``sys.argv``: ``main(argv)`` is callable
+        # from a script or a test, and recording the interpreter's own argv there
+        # would label the run with something that never described it.
+        "argv": list(getattr(args, "_argv", None) or sys.argv[1:]),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "host": {"platform": platform.platform(), "python": sys.version.split()[0]},
         "versions": {
@@ -339,7 +347,7 @@ def write_manifest(
             "eval_on_train": cfg.data.split_mode == "reconstruction",
         },
     }
-    path = out_dir / "manifest.json"
+    path = Path(path) if path is not None else (out_dir / "manifest.json")
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2, default=str)
     return path
@@ -449,10 +457,37 @@ def run(args: argparse.Namespace) -> int:
         trainer = Trainer(cfg, split, device=device, log_fn=log_fn)
         payload = trainer.load(args.eval_only)
         metrics = trainer.evaluate()
-        manifest = write_manifest(cfg, out_dir, report, args=args, mode=mode)
+        # An evaluation must never overwrite the training run's record. The
+        # manifest is what a human opens to see how a number was produced, and
+        # `--eval-only` was rewriting it with mode="eval" and its own argv,
+        # destroying the training entry -- irreversibly, since nothing else kept
+        # a copy. A separate file is written instead, named after the checkpoint
+        # so several evaluations can coexist.
+        eval_manifest = out_dir / f"manifest.eval.{Path(args.eval_only).stem}.json"
+        write_manifest(
+            cfg, out_dir, report, args=args, mode=mode, path=eval_manifest
+        )
         trainer.close()
-        print(json.dumps({"metrics": metrics, "step": payload.get("step")}, indent=2))
-        print(f"manifest: {manifest}")
+        if not metrics:
+            print(
+                json.dumps(
+                    {
+                        "metrics": {},
+                        "step": payload.get("step"),
+                        "warning": (
+                            "no held-out set: data.split_mode="
+                            f"{cfg.data.split_mode!r} trains on every image, so "
+                            "evaluate() has nothing to score. Re-run with "
+                            "data.split_mode=experiment (and data.eval_ratio>0) "
+                            "to get a generalisation number."
+                        ),
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(json.dumps({"metrics": metrics, "step": payload.get("step")}, indent=2))
+        print(f"manifest: {eval_manifest}")
         return 0
 
     manifest = write_manifest(cfg, out_dir, report, args=args, mode=mode)
@@ -486,6 +521,8 @@ def run(args: argparse.Namespace) -> int:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Recorded verbatim by write_manifest; see the note there.
+    args._argv = list(argv) if argv is not None else sys.argv[1:]
 
     if args.eval_only and (args.resume or args.dry_run):
         parser.error("--eval-only cannot be combined with --resume or --dry-run")

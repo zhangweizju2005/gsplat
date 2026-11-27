@@ -1288,3 +1288,97 @@ def test_resume_matches_an_uninterrupted_run(tmp_path: Path):
         f"resumed run diverged from the uninterrupted one: max|diff|={diff:.3e} "
         "(pre-fix this was ~2.9e-05 from batch order alone)"
     )
+
+
+# ---------------------------------------------------------------------------
+# CLI: --eval-only must not consume the training record
+# ---------------------------------------------------------------------------
+def test_eval_only_does_not_overwrite_the_training_manifest(tmp_path: Path):
+    """Re-evaluating a checkpoint must not destroy the run that produced it.
+
+    `--eval-only` called `write_manifest(...)` with the default path, so it
+    rewrote `<out>/manifest.json` with ``mode="eval"`` and its own ``argv``. The
+    manifest is the only record of how a number was produced, and the overwrite
+    was irreversible -- nothing else kept a copy.
+    """
+    import json as _json
+    from surfel.train import run as run_mod
+
+    root = tmp_path / "scene"
+    make_synthetic_colmap(root, n_frames=8, width=64, height=48)
+    out = tmp_path / "out"
+    common = [
+        f"--data.path={root}",
+        "--profile", "smoke",
+        "--set", "data.split_mode=experiment",
+        "--set", "data.eval_ratio=0.25",
+        "--set", "gauge.scale_source=extent",
+        "--set", "data.depth.enabled=true",
+        "--set", "data.depth.dir=depths",
+        "--set", "data.depth.weight=0.05",
+        "--set", "model.sh_degree=0",
+        "--set", "train.max_steps=3",
+        "--set", "train.eval_steps=[]",
+        "--set", "train.save_steps=[]",
+        f"--out={out}",
+    ]
+    assert run_mod.main(common) == 0
+
+    train_manifest = out / "manifest.json"
+    before = _json.loads(train_manifest.read_text(encoding="utf-8"))
+    assert before["mode"] == "train"
+
+    ckpt = out / "ckpts" / "final.pt"
+    assert ckpt.exists()
+    assert run_mod.main(common + [f"--eval-only={ckpt}"]) == 0
+
+    after = _json.loads(train_manifest.read_text(encoding="utf-8"))
+    assert after["mode"] == "train", (
+        "the training manifest was rewritten by --eval-only; its record is gone"
+    )
+    assert after["protocol"] == before["protocol"]
+    assert (out / "manifest.eval.final.json").exists(), (
+        "the evaluation wrote no manifest of its own"
+    )
+
+
+def test_eval_only_reports_why_it_has_no_metrics(tmp_path: Path, capsys):
+    """An empty ``metrics`` dict must come with an explanation, not just ``{}``.
+
+    With ``split_mode="reconstruction"`` every image is trained on, so
+    ``evaluate()`` has nothing to score and returns ``{}``. The CLI printed that
+    bare dict, which reads as "the model is fine, there are just no numbers"
+    rather than "you asked for a generalisation metric from a fit".
+    """
+    import json as _json
+    from surfel.train import run as run_mod
+
+    root = tmp_path / "scene"
+    make_synthetic_colmap(root, n_frames=8, width=64, height=48)
+    out = tmp_path / "out"
+    common = [
+        f"--data.path={root}",
+        "--profile", "smoke",
+        "--set", "data.split_mode=reconstruction",
+        "--set", "gauge.scale_source=extent",
+        "--set", "data.depth.enabled=true",
+        "--set", "data.depth.dir=depths",
+        "--set", "data.depth.weight=0.05",
+        "--set", "model.sh_degree=0",
+        "--set", "train.max_steps=3",
+        "--set", "train.eval_steps=[]",
+        "--set", "train.save_steps=[]",
+        f"--out={out}",
+    ]
+    assert run_mod.main(common) == 0
+    capsys.readouterr()  # discard the training output
+
+    ckpt = out / "ckpts" / "final.pt"
+    assert run_mod.main(common + [f"--eval-only={ckpt}"]) == 0
+
+    printed = capsys.readouterr().out
+    start = printed.find("{")
+    assert start != -1, "no JSON block was printed"
+    payload = _json.loads(printed[start : printed.rfind("}") + 1])
+    assert payload["metrics"] == {}
+    assert "warning" in payload and "split_mode" in payload["warning"]

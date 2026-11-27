@@ -398,3 +398,125 @@ def test_pick_depth_suffix_rejects_empty(tmp_path: Path):
     d.mkdir()
     with pytest.raises(FileNotFoundError):
         pick_depth_suffix(d)
+
+
+# --------------------------------------------------------------------------
+# Parser-side handling of every schema-legal init/gauge value
+# --------------------------------------------------------------------------
+def _minimal_bundle(root: Path, *, with_depth: bool = True) -> Path:
+    """A three-frame bundle with 4x4 depth, enough for parse_feedforward."""
+    import imageio.v2 as imageio
+
+    out = root / "bundle"
+    (out / "images").mkdir(parents=True, exist_ok=True)
+    w = BundleWriter(
+        root=out,
+        source="test",
+        image_grid=(16, 12),
+        depth_grid=(8, 6) if with_depth else None,
+        depth_format="npy",
+    )
+    K = np.array([[12.0, 0.0, 8.0], [0.0, 12.0, 6.0], [0.0, 0.0, 1.0]])
+    for i in range(3):
+        img = np.full((12, 16, 3), 30 + i, np.uint8)
+        p = root / f"img_{i}.png"
+        imageio.imwrite(p, img)
+        c2w = np.eye(4)
+        c2w[0, 3] = float(i)
+        w.add(
+            name=f"{i:06d}.png",
+            image_src=p,
+            K=K,
+            c2w=c2w,
+            depth=(np.full((6, 8), 2.0, np.float32) if with_depth else None),
+        )
+    w.write()
+    return out
+
+
+def _bundle_cfg(bundle: Path, out_dir: Path, **overrides: str):
+    from surfel.config import build_config
+
+    base = [
+        f"data.parser=feedforward",
+        f"data.path={bundle}",
+        "data.init_points=depth",
+        "data.split_mode=reconstruction",
+        "gauge.scale_source=extent",
+        "gauge.mode=normalize",
+        "train.lr.means_per_spacing=0.01",
+        "model.sh_degree=0",
+        f"train.out_dir={out_dir}",
+    ]
+    base.extend(f"{k}={v}" for k, v in overrides.items())
+    return build_config(overrides=base)
+
+
+def test_gauge_mode_none_parses_on_the_bundle_path(tmp_path: Path):
+    """``gauge.mode="none"`` must produce a report, not a TypeError.
+
+    The schema lists "none" as legal -- it means "leave the bundle in its own
+    arbitrary gauge" -- but the report builder called
+    `GaugeApplication(source=...)` and raised
+    `TypeError: missing 4 required positional arguments` for it. The parser test
+    surface only covered the COLMAP path, where the branch is not reached.
+    """
+    from surfel.data import parse_dataset
+
+    bundle = _minimal_bundle(tmp_path)
+    cfg = _bundle_cfg(bundle, tmp_path / "out", **{"gauge.mode": "none"})
+    cfg.validate()
+
+    split, report = parse_dataset(cfg)
+    assert report.gauge is not None
+    assert report.gauge.source == "none"
+    assert report.gauge.scale_only == 1.0
+    assert report.gauge.applied_to_depth is False
+    # No normalisation happened, so poses keep the bundle's own scale.
+    assert report.n_points > 0
+
+
+def test_init_points_none_is_refused_at_config_time(tmp_path: Path):
+    """An empty start must be refused early, with the real reason.
+
+    ``init_points="none"`` parses to an empty cloud, which then died deep inside
+    the trainer on a kNN spacing measured over zero points
+    (`measured kNN spacing is nan`) -- a message that points at the learning rate
+    rather than at the impossible configuration. The deeper reason is that gsplat
+    cannot grow a model from zero Gaussians at all: DefaultStrategy needs
+    existing candidates to split or duplicate, and MCMC's
+    `n_target = min(cap_max, 1.05 * n)` stays 0 when n = 0. It is now rejected by
+    ``Config.validate`` so no data source can reach the rasteriser with it.
+    """
+    from surfel.config import build_config
+
+    # ``build_config`` validates as it assembles, so the refusal happens there
+    # rather than at a later explicit ``cfg.validate()``.
+    with pytest.raises(ValueError, match="not trainable"):
+        build_config(
+            overrides=[
+                f"data.path={tmp_path / 'bundle'}",
+                "data.parser=feedforward",
+                "data.init_points=none",
+                "gauge.scale_source=extent",
+            ]
+        )
+
+
+def test_init_points_none_message_does_not_recommend_itself():
+    """The parser's own error text must not suggest an untrainable fallback.
+
+    A missing-depth bundle used to say "Re-export with depths, or set
+    data.init_points=none", i.e. it pointed at a configuration that cannot
+    train. Same for the sparse-points branch. Both now name only working
+    alternatives.
+    """
+    import inspect
+
+    from surfel.data import parser as parser_mod
+
+    src = inspect.getsource(parser_mod.parse_feedforward)
+    assert "init_points=none" not in src, (
+        "parse_feedforward still recommends init_points='none', which cannot "
+        "train"
+    )

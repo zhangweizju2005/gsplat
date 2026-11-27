@@ -621,12 +621,14 @@ def parse_feedforward(cfg: Config) -> Tuple[Split, ParseReport]:
     if not bundle.has_depth and cfg.data.init_points == "depth":
         raise DatasetError(
             "init_points='depth' needs depth maps, but the bundle has none. "
-            "Re-export with depths, or set data.init_points=none."
+            "Re-export the bundle with depths. (init_points='none' is not an "
+            "alternative: gsplat cannot grow a model from zero Gaussians, so an "
+            "empty start would train nothing.)"
         )
     if cfg.data.init_points == "sparse":
         raise DatasetError(
             "init_points='sparse' needs a COLMAP points3D cloud; a feed-forward "
-            "bundle has none. Use init_points='depth' (DGI) or 'none'."
+            "bundle has none. Use init_points='depth' (DGI)."
         )
 
     notes: List[str] = [
@@ -814,9 +816,20 @@ def parse_feedforward(cfg: Config) -> Tuple[Split, ParseReport]:
         n_points=scene.points.shape[0],
         depth_maps=sum(1 for c in cameras if c.depth_path is not None),
         depth_remapped=0,
+        # ``gauge.mode="none"`` leaves the bundle in its own arbitrary gauge.
+        # That is a valid choice -- it means "do not normalise" -- so it must be
+        # reported as an identity application rather than crashing. The previous
+        # `GaugeApplication(source=...)` form omitted the four required fields and
+        # raised TypeError for a value the schema explicitly allows.
         gauge=gauge_app
         if gauge_app is not None
-        else GaugeApplication(source=cfg.gauge.mode),
+        else GaugeApplication(
+            sim3=None,
+            scale_only=1.0,
+            source=cfg.gauge.mode,
+            applied_to_depth=False,
+            notes=list(gauge_notes),
+        ),
         notes=notes,
     )
     return Split(train=train, val=val), report
