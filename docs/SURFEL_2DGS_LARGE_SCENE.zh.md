@@ -46,7 +46,7 @@
 自定义特征维度（如 7/10/13）会直接 `ValueError: Unsupported number of color channels: 7`，
 而在 1.5.3 下是静默补零可用的。若需要新通道数必须重编。
 
-### 1.2 两处上游 C++ 缺陷（已修复并提交，`45e0760b`）
+### 1.2 两处上游 C++ 缺陷（已修复并提交，`32371d88`）
 
 这两处是上游 1.6.0 的真实缺陷，已在本仓库修复、加测试并提交。
 **换机器/重装时若基于未打补丁的 1.6.0，必须重新应用。**
@@ -255,7 +255,10 @@ viewmats = torch.randn(B, C, 4, 4)  # 必须匹配 means 的 batch 维
 ```
 
 两个易踩坑：
-1. **SH 不能带 batch**。这是有意契约（`Rendering.cpp:1621`，注释写明 "shared across batch/camera dims"），一套高斯只有一份颜色表。错误信息容易被误读成"不支持多 batch"。
+1. **SH 不能带 batch**。这是有意契约（`gsplat/rendering.py:1394` 的 docstring 写明
+   "[N, K, D] for SH coefficients (shared across batch/camera dims)"，由
+   `Rendering.cpp:1621` 的 `TORCH_CHECK(colors.dim() == 3 ...)` 强制），一套高斯
+   只有一份颜色表。错误信息容易被误读成"不支持多 batch"。
 2. **`viewmats` 的维数由 `means.dim()` 推导**（`batch_ndim = means.dim() - 2`，要求 `viewmats.dim() == batch_ndim + 3`）。`means=[N,3]` 必须配 `viewmats=[C,4,4]`，给 `[1,C,4,4]` 会被拒。
 
 ### 3.6 hbb1 后端对拍入口
@@ -1010,22 +1013,34 @@ pred_n = pred_inv / gt_inv[valid].median().detach()   # 注意：用的是 GT �
 GSL 实际上是**对所有深度源都开**的。因此在复现归档基线时，
 `surfel` 必须设 `data.depth.per_frame_median_norm=True`（且
 `gauge.apply_to_depth=False`），否则损失量级与 GSL 不同、权重 0.05 不可直接迁移。
-另外 `surfel` 用的是"各自中位数"，与 GSL 的"都用 GT 中位数"有差异——
-复现时应改用 GSL 的语义（见 §8.6.2）。
+
+> **已实现（2026-11-27 核对）**：`surfel` 现在与 GSL 逐字同构，两侧都除以
+> **GT** 中位数。`surfel/train/losses.py:243-246`：
+>
+> ```python
+> gt_med = _masked_median(gt_inv.detach(), v)
+> pred_n = pred_inv / gt_med.clamp_min(eps)   # 两侧都用 GT 中位数
+> gt_n   = gt_inv / gt_med.clamp_min(eps)
+> ```
+>
+> 早期版本用"各自中位数"，本节曾据此建议修正；该差异已消除。
 
 ### 8.6.2 `depth_outlier_clip` 是必需的第三道保护
 
 同一文件 `:33` 有 `depth_outlier_clip: float = 10.0`，在算 `mean` 之前
 `clamp(d, ±clip)`。注释直接指向 f0_gtpose step 3300 那次爆炸（0.001 → 81,124）。
 
-`surfel` 目前有 `depth_eps` 与 `depth_alpha_mask` 两道保护，但**没有**离群栅栏。
-理论上 alpha 掩码已排除 `pred_depth→0` 的像素，但若掩码阈值以下的像素仍有极小
-正值（例如 alpha=0.005），`1/pred` 依然会给出尖峰。**建议补上**：
+`surfel` 用 `depth_eps`、`depth_alpha_mask` 和离群栅栏三道保护：
 
-```python
-if clip and clip > 0:
-    diff = torch.clamp(diff, -clip, clip)
-```
+> **已实现（2026-11-27 核对）**：`LossConfig.depth_outlier_clip: Optional[float] = 10.0`
+> （`surfel/config/schema.py:313`），并在 `surfel/train/losses.py:249-250` 真正执行：
+>
+> ```python
+> if outlier_clip is not None and outlier_clip > 0:
+>     diff = torch.clamp(diff, -float(outlier_clip), float(outlier_clip))
+> ```
+>
+> 早期版本只有前两道，本节曾建议补上第三道；该缺口已补。
 
 ---
 
@@ -1244,7 +1259,8 @@ gauge: normalize, s=0.00282, R=..., t=..., depth scaled=True
 | 项 | `object`（对齐上游） | `aerial`（7k，对齐归档） | `aerial_long`（30k） |
 |---|---|---|---|
 | `max_steps` | 30000 | **7000** | 30000 |
-| `density.grow_grad2d` | 2e-4 | **6e-4** | 6e-4 |
+| `train.lr.means_per_spacing` | **0.01** | **0.01** | **0.01** |
+| `density.grow_grad2d` | 2e-4 | **2e-4**（§14.9.4 实测最优） | 6e-4 |
 | `density.refine_start_iter` | 500 | 500 | 500 |
 | `density.refine_stop_iter` | 15000 | **7000** | 20000 |
 | `density.refine_every` | 100 | 100 | 100 |
@@ -1257,6 +1273,23 @@ gauge: normalize, s=0.00282, R=..., t=..., depth scaled=True
 | `gauge.scale_source` | `extent` | **`depth_p99`** | `depth_p99` |
 | `model.sh_degree` | 3 | 3 | 3 |
 | `model.near/far` | `None`（派生） | `None`（派生） | `None`（派生） |
+
+**`train.lr.means_per_spacing` 是这份表里最重要的字段**（§14.9）。它是唯一的
+gauge 无关学习率形式：`means` 是长度量纲，`1.6e-4` 在 garden 的点云上等于
+**0.119 个 kNN 间距/步**，实测只有 22.52 dB；`0.01` 实测 24.92 dB，且与 GSL 归档
+MatrixCity f0_gtpose 的 0.0104 一致。其余四个属性的 LR（`scales`/`quats`/
+`opacities`/`sh`）在 log 空间，跨数据集不该改。
+
+> **`aerial.grow_grad2d` 为什么是 2e-4 而不是归档的 6e-4**：§14.9.4 的 2×2 归因
+> 显示，在修正学习率之后，2e-4 / 0.003 比 6e-4 / 0.01 高 **0.67 dB**
+> （25.685 vs 25.013）；而在错误学习率下两者无差别（22.52 vs 22.744）。
+> 归档值 6e-4 是为了配合那个过大的学习率而调高的，学习率修正后不再适用。
+> `aerial_long` 仍是 6e-4：它的 30000 步调度**未经实测**，不做未经验证的迁移。
+
+> **`aerial_long` / `object` 的 `means_per_spacing` 是迁移值，不是实测最优**：
+> 扫描只覆盖 garden 的 7000 步。更长调度可以承受略大的步长，但那没有测量；
+> 0.01 应视为下界而非最优点。
+
 
 > 注意：官方 2DGS 示例的 `prune_opa` 默认是 **0.05**，而 2DGS 论文/归档配方是 **0.005**。
 > 这是一个真实的默认值分歧，不是笔误 —— 两者不可混用同一份配置对比。
@@ -1732,7 +1765,7 @@ DGI 从 185 帧反投影，同一块表面被重复写入很多次。第 0 步�
 > **撤回声明（2026-11-27）**：本节原本断言"足迹变大 → 超阈比例升高 →
 > 稠密化失控"，并据此提出按足迹放大阈值的补偿方案（§14.6 的实现）。
 > **它的因果归因是错的。** §14.9.4 的 2×2 归因显示：把 `means_lr` 修正后，
-> **旧阈值（2e-4 / 0.003）反而比"补偿后"的 aerial 阈值（6e-4 / 0.01）高
+> **旧阈值（2e-4 / 0.003）反而比"补偿后"的阈值（6e-4 / 0.01）高
 > 0.67 dB**（25.685 vs 25.013）。真正的驱动量是**位置学习率**，不是足迹。
 > 本节保留的是**测量本身**（超阈比例确实随分辨率变化），被撤回的是**它的
 > 解释和由此得出的补偿建议**。`density.footprint_compensate` 仍然保留，
@@ -1910,9 +1943,10 @@ refine 事件零净增长，防护直接抛错。
 
 **测量 3：`means_lr` 扫描是一条单峰曲线，峰值就在 f0_gtpose 的量级。**
 
-固定 aerial profile 的其余全部参数（`grow_grad2d=6e-4`、`grow_scale3d=0.01`、
-`refine_stop=7000`、dist/normal 正则起始步），只改 `means_lr`，按
-`means_lr / kNN_spacing` 取 5 个无量纲档位，garden 1297×840，7000 步：
+固定其余全部参数（密度阈值 `grow_grad2d=6e-4`、`grow_scale3d=0.01`，
+即当时 profile 的归档值；`refine_stop=7000`；dist/normal 正则起始步不变），
+只改 `means_lr`，按 `means_lr / kNN_spacing` 取 5 个无量纲档位，
+garden 1297×840，7000 步：
 
 | `rel_step` | means_lr | PSNR | SSIM | 最终高斯 | dup | split |
 |---|---|---|---|---|---|---|
@@ -1954,8 +1988,8 @@ refine 事件零净增长，防护直接抛错。
 
 ### 14.9.4 归因：3.16 dB 来自学习率，还是来自同时改的密度阈值？
 
-扫描的同时把密度阈值也改回了 aerial profile 的值（`grow_grad2d` 2e-4 → 6e-4，
-`grow_scale3d` 0.003 → 0.01），所以必须先拆开。补全四个格子，
+扫描的同时把密度阈值也换了一组（2e-4 / 0.003 → 6e-4 / 0.01，后者是 421b121d
+之前的 profile 值、也是归档 GSL 的值），所以必须先拆开。补全四个格子，
 garden 1297×840、7000 步：
 
 | `rel_step` | `grow_grad2d` | `grow_scale3d` | PSNR | SSIM | 最终高斯 | dup |
@@ -2039,11 +2073,12 @@ f0_gtpose。**
 | `densify_grad_threshold` 口径标定 | ✅ 已解决（§5.1，无需重标定） |
 | `scene_scale` 默认值 bug 的大场景影响 | ✅ 已量化（§5.2） |
 | 2DGS `absgrad` | ✅ 已确认不可用（§3.4） |
-| 全分辨率 1080p 训练的稳定配置 | ⚠️ 归档的 1080p 臂（17.97 / 16.87）与 518×280 臂（20.28）**不可比**（协议不同） |
+| 全分辨率 1080p 训练的稳定配置 | ⚠️ 归档的 1080p 臂（17.97 / 16.87）与 518×280 臂（20.28）**不可比**（协议不同）。**另见 §14.9.1**：归档的 1080p 深度实为 280×518 上采样，不是真正的全分辨率网格 |
 | 前馈 Scal3R/VGGT 直连（非 GSL 中间结果） | ⚠️ 未做，但 DGI / gauge / 对齐原语已就绪 |
 | 分区 / 合并 / LOD | ⚠️ 未做（不在当前阶段） |
 | MCMC 策略在大场景的实测 | ⚠️ 仅有 smoke |
-| `surfel/` 包的端到端验证 | ⚠️ 进行中，见附录 B |
+| `surfel/` 包的端到端验证 | ✅ 26 项测试在干净 clone 上通过；garden 1297×840 实测 25.685 dB（§14.9.4） |
+| 混合 gauge 路径（前馈位姿+深度初始化，GT 位姿对齐） | ⚠️ **未在 gsplat 上复现**，见 §14.10 |
 
 ## 附录 B：`surfel/` 包结构（配套实现）
 
@@ -2076,7 +2111,9 @@ surfel/
     └── trainer.py      # 官方 gsplat 顺序的训练环
 ```
 
-**尚未完成**：Scal3R ingest CLI、完整测试套件、`f0_gtpose` 端到端验证。
+**尚未完成**：Scal3R ingest CLI（`surfel/cli/`、`__main__.py` 均不存在）、
+`gsl_compat` YAML 方言转换器（映射表见 §12.4.7）、显式几何冻结开关、
+混合 gauge 路径在 gsplat 上的复现（§14.10）。
 
 ---
 

@@ -622,8 +622,6 @@ def align_scal3r_to_colmap(
             "Scal3R reader resolved name_map.json: its names must be the "
             "original filenames, not the zero-padded indices."
         )
-    src = np.stack([scal3r_cam_to_worlds[s_index[n]][:3, 3] for n in common])
-    ref = np.stack([cmap[n].camera_center for n in common])
     sim, report = align_to_reference(
         np.asarray(scal3r_cam_to_worlds)[[s_index[n] for n in common]],
         np.stack([cmap[n].cam_to_world for n in common]),

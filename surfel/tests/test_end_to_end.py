@@ -876,3 +876,37 @@ def test_aerial_profile_encodes_the_measured_best_arm():
     # Decay must be configured so it actually runs.
     assert cfg.train.lr.decay_means is True
     assert 0.0 < cfg.train.lr.means_final_ratio < 1.0
+
+
+def test_every_real_profile_states_a_gauge_free_means_lr():
+    """No production profile may inherit the dimensionful default.
+
+    The sweep found the absolute default (1.6e-4) sits at 0.119 kNN
+    spacings/step on garden and scores ~3 dB below 0.010. That fix was first
+    applied only to ``aerial``, leaving ``aerial_long`` -- the profile sized for a
+    30000-step production run -- with the bad value, which is the kind of
+    partial rollout a per-profile test catches and a per-dataset sweep does not.
+
+    ``smoke`` is exempt by design: it runs 200 steps as a wiring check and its
+    numbers are meaningless.
+    """
+    from surfel.config.profiles import make_profile_config, profile_names
+
+    for name in profile_names():
+        cfg = make_profile_config(name)
+        cfg.data.path = "/tmp/x"
+        cfg.gauge.scale_source = "extent"
+        cfg.validate()
+        if name == "smoke":
+            assert cfg.train.lr.means_per_spacing is None
+            continue
+        assert cfg.train.lr.means_per_spacing is not None, (
+            f"profile {name!r} inherits train.lr.means = {cfg.train.lr.means}, "
+            "which is a length and therefore not comparable across scenes. "
+            "Set train.lr.means_per_spacing (0.01 was measured best on garden)."
+        )
+        assert 0.001 <= cfg.train.lr.means_per_spacing <= 0.05, (
+            f"profile {name!r} uses rel_step "
+            f"{cfg.train.lr.means_per_spacing}, outside the measured-usable band "
+            "(0.003-0.030; 0.1 measured 2 dB worse)"
+        )

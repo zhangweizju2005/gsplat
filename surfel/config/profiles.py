@@ -113,6 +113,16 @@ _PROFILES: dict[str, dict[str, object]] = {
         "train.eval_steps": "[7000, 30000]",
         "train.save_steps": "[7000, 30000]",
         "train.lr.decay_means": True,
+        # Same gauge-free form as ``aerial``, and for the same reason: the
+        # absolute default (1.6e-4) lands at 0.119 kNN spacings/step on garden,
+        # which measured 22.52 dB against 24.92 dB at 0.010. Leaving this unset
+        # here would mean the only profile sized for a real production run kept
+        # the value the sweep showed to be ~3 dB worse.
+        #
+        # Not retuned for the 30000-step schedule: the sweep covered 7000 steps
+        # only. A longer run can afford a marginally larger step, but that is
+        # unmeasured -- treat 0.01 as the floor and validate before raising it.
+        "train.lr.means_per_spacing": 0.01,
         "train.spatial_lr_scale": 1.0,
         "density.strategy": "default",
         "density.prune_opa": 0.005,
@@ -139,6 +149,15 @@ _PROFILES: dict[str, dict[str, object]] = {
         "train.eval_steps": "[7000, 30000]",
         "train.save_steps": "[7000, 30000]",
         "train.lr.decay_means": True,
+        # Gauge-free means LR, as in ``aerial``. Object-centric scenes have a
+        # very different kNN spacing from an aerial block, which is precisely
+        # why the absolute form cannot be shared between profiles: the same
+        # 1.6e-4 is ~0.12 spacings/step on one and something else entirely on
+        # the other. Stating the ratio makes both profiles sit at the same
+        # relative rate without hard-coding either scene's units.
+        # Unmeasured on an object scene at 30000 steps; 0.01 is the value the
+        # garden sweep selected, treated as a starting point, not an optimum.
+        "train.lr.means_per_spacing": 0.01,
         "train.spatial_lr_scale": 1.0,
         "density.strategy": "default",
         "density.prune_opa": 0.005,
