@@ -654,3 +654,183 @@ def test_render_sizes_use_width_first_on_both_parsers(tmp_path: Path):
     # The fixture is deliberately non-square, so a transposition cannot pass.
     assert w != h
     assert report.render_size_labels() == f"{w}x{h}"
+
+
+# --------------------------------------------------------------------------
+# Depth-grid -> render-grid intrinsics: resize vs cover-crop
+# --------------------------------------------------------------------------
+def test_cover_resample_keeps_the_focal_ratio_isotropic(tmp_path: Path):
+    """A uniform-resize+centre-crop must produce a *single* K scale factor.
+
+    Scal3R builds its input with ``resize_to_cover`` then ``crop_nhwc_image``,
+    so the depth grid is a window into a uniformly resized image. Treating that
+    as a per-axis stretch is silently wrong: on the real 1297x840 garden bundle
+    with 518x322 depth it produced ``fx/fy = 0.9636`` where both the physics and
+    the depth intrinsics say ``1.0040`` -- a 3.6% vertical-focal error.
+
+    The assertion is on the ratio rather than on absolute values, because that is
+    the invariant that a lens guarantees and the quantity that was wrong.
+    """
+    from surfel.data.parser import _scale_K_to_grid
+
+    # 518x322 depth derived from 1297x840 by uniform cover-resize + centre crop.
+    K_depth = np.array(
+        [[378.494, 0.0, 259.0], [0.0, 377.002, 161.0], [0.0, 0.0, 1.0]]
+    )
+    notes: list = []
+
+    isotropic = _scale_K_to_grid(
+        K_depth,
+        (518, 322),
+        (1297, 840),
+        notes=notes,
+        name="render",
+        resample="cover",
+    )
+    ratio = isotropic[0, 0] / isotropic[1, 1]
+    assert abs(ratio - K_depth[0, 0] / K_depth[1, 1]) < 1e-9, (
+        f"cover resample changed fx/fy from "
+        f"{K_depth[0,0]/K_depth[1,1]:.6f} to {ratio:.6f}; it must be preserved"
+    )
+
+    # The per-axis path (what a real anisotropic resample needs) does stretch it,
+    # which is why the two cases have to be distinguishable in the manifest.
+    per_axis = _scale_K_to_grid(
+        K_depth, (518, 322), (1297, 840), notes=notes, name="per-axis"
+    )
+    assert abs(per_axis[0, 0] / per_axis[1, 1] - 1.0) > 0.01
+
+
+def test_bundle_records_and_reports_the_depth_resample_mode(tmp_path: Path):
+    """The mode has to survive a write/read round-trip, or it cannot be honoured."""
+    w = BundleWriter(
+        root=tmp_path / "b",
+        source="test",
+        image_grid=(16, 12),
+        depth_grid=(8, 6),
+        depth_resample="cover",
+        depth_format="npy",
+    )
+    import imageio.v2 as imageio
+
+    p = tmp_path / "i.png"
+    imageio.imwrite(p, np.zeros((12, 16, 3), np.uint8))
+    w.add(
+        name="000000.png",
+        image_src=p,
+        K=np.array([[10.0, 0, 8], [0, 10.0, 6], [0, 0, 1]]),
+        c2w=np.eye(4),
+        depth=np.ones((6, 8), np.float32),
+    )
+    w.write()
+
+    b = read_bundle(tmp_path / "b")
+    assert b.depth_resample == "cover"
+
+
+def test_unknown_depth_resample_is_refused_not_guessed():
+    """''/'resize'/'cover'/None are the only legal values.
+
+    A typo must not fall through to the per-axis branch: that branch is right for
+    a genuine anisotropic resize and wrong for a crop, and the difference is a
+    few percent of focal length with no error message.
+    """
+    import json
+
+    from surfel.data.feedforward import read_bundle
+
+    # Build a minimal manifest directly; the reader validates before it looks at
+    # frames, so no images or depth files are needed.
+    import tempfile
+
+    root = Path(tempfile.mkdtemp())
+    (root / "frames.json").write_text(
+        json.dumps(
+            {
+                "format": FORMAT_ID,
+                "source": "test",
+                "image_grid": [16, 12],
+                "depth_grid": [8, 6],
+                "depth_resample": "stretch",
+                "frames": [
+                    {
+                        "index": 0,
+                        "name": "a.png",
+                        "image": "images/a.png",
+                        "depth": "depths/a.npy",
+                        "K": np.eye(3).tolist(),
+                        "c2w": np.eye(4).tolist(),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unknown depth_resample"):
+        read_bundle(root)
+
+
+def test_scal3r_crop_geometry_matches_the_upstream_pipeline():
+    """The recorded geometry must equal what Scal3R actually does.
+
+    Verified against Scal3R's own ``determine_target_size`` / ``resize_to_cover``
+    / centred crop for garden 1297x840: target 518x322, resized 518x336, crop
+    top=7. The 14 px alignment is why the resized height is 336 and not 322, and
+    missing it makes the vertical scale wrong by 4%.
+    """
+    from surfel.data.feedforward import scal3r_crop_geometry
+
+    assert scal3r_crop_geometry(1297, 840) == (0, 7, 518, 336)
+    # A square image needs no crop at all.
+    assert scal3r_crop_geometry(1024, 1024) == (0, 0, 518, 518)
+    # Same-aspect and taller-than-crop captures: the resized frame covers the
+    # target, so the crop is well defined.
+    for w, h in ((4032, 3024), (3024, 4032)):
+        left, top, rw, rh = scal3r_crop_geometry(w, h)
+        assert left >= 0 and top >= 0, f"{w}x{h}: negative crop offset"
+        assert rw >= 518 and rh >= 322, (
+            f"{w}x{h}: resized {rw}x{rh} does not cover the 518x322 target"
+        )
+
+    # Known upstream edge: for a wider aspect than 518/322 the 14 px alignment
+    # can round the resized height *below* the target (1920x1080 -> 294 < 322),
+    # and Scal3R's own `crop_nhwc_image` then computes a negative start offset.
+    # The wrapper mirrors that rather than silently inventing a different
+    # pipeline, so the value is recorded as-is; a bundle built from such a run
+    # carries a geometry that does not fit, which is visible in the manifest.
+    _, top_wide, _, resized_h_wide = scal3r_crop_geometry(1920, 1080)
+    assert resized_h_wide < 322
+
+
+def test_cover_geometry_puts_the_principal_point_back_at_centre():
+    """De-cropping must restore the centre, and keep the focal ratio.
+
+    The depth K's principal point is the centre of the *cropped* grid, i.e.
+    (259, 161) in a 518x322 crop of a 518x336 resize. Mapping it to the render
+    grid has to add the 7 cropped rows before scaling; a plain rescale leaves
+    the point 11 px high, which is a silent vertical shift of the whole image.
+    """
+    from surfel.data.parser import _scale_K_to_grid
+
+    K_depth = np.array(
+        [[378.4939, 0.0, 259.0], [0.0, 377.0016, 161.0], [0.0, 0.0, 1.0]]
+    )
+    notes: list = []
+    out = _scale_K_to_grid(
+        K_depth,
+        (518, 322),
+        (1297, 840),
+        notes=notes,
+        name="render",
+        resample="cover",
+        crop_offset=(0, 7, 518, 336),
+    )
+
+    # Centre of the image, on both axes.
+    assert abs(out[0, 2] / 1297 - 0.5) < 1e-3
+    assert abs(out[1, 2] / 840 - 0.5) < 1e-3
+
+    # The focal ratio follows the resize, not the crop: the depth K was
+    # 1.00396 and the render K must land near it, not at 0.96.
+    ratio = out[0, 0] / out[1, 1]
+    assert abs(ratio - 1.0055) < 2e-3, f"fx/fy = {ratio:.5f}, expected ~1.0055"

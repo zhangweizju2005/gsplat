@@ -714,6 +714,8 @@ def parse_feedforward(cfg: Config) -> Tuple[Split, ParseReport]:
             (render_w, render_h),
             notes=notes,
             name="render",
+            resample=bundle.depth_resample,
+            crop_offset=bundle.depth_crop_offset,
         )
 
     cameras: List[Camera] = []
@@ -874,20 +876,78 @@ def _scale_K_to_grid(
     *,
     notes: List[str],
     name: str,
+    resample: Optional[str] = None,
+    crop_offset: Optional[Tuple[int, int]] = None,
 ) -> np.ndarray:
-    """Rescale intrinsics from the depth grid to the image grid.
+    """Rescale intrinsics from one grid to another.
 
-    Per-axis rather than uniform: the bundle states both grids, so the mapping is
-    defined even when the aspect changed. A non-uniform case is flagged in the
-    notes because it means depth supervision has to remap, not just resize.
+    Two models, and which one applies is a property of how the depth was made,
+    not something that can be inferred from the grids:
+
+    ``resample="cover"``
+        The source grid is a uniform resize-to-cover of the destination followed
+        by a centre crop (Scal3R's pipeline: ``resize_to_cover`` then
+        ``crop_nhwc_image``). The scale is therefore *single* -- one number for
+        both axes -- and the principal point also shifts by the crop.
+
+    otherwise (``None`` / ``"resize"``)
+        A per-axis resize of the same image. ``sx`` and ``sy`` may differ, which
+        is what a caller who resampled to a different aspect actually did.
+
+    Getting this wrong is silent: on the 1297x840 garden bundle with 518x322
+    depth, treating Scal3R's cover-crop as a per-axis stretch produced
+    ``fx/fy = 0.9636`` where the truth is ``1.0040`` -- a 3.6% vertical-focal
+    error, with no warning and no visible artefact other than a slightly wrong
+    reconstruction.
     """
     if from_grid is None or (int(from_grid[0]), int(from_grid[1])) == (
         int(to_grid[0]),
         int(to_grid[1]),
     ):
         return np.array(K, dtype=np.float64, copy=True)
-    sx = float(to_grid[0]) / float(from_grid[0])
-    sy = float(to_grid[1]) / float(from_grid[1])
+
+    fw, fh = int(from_grid[0]), int(from_grid[1])
+    tw, th = int(to_grid[0]), int(to_grid[1])
+
+    if resample == "cover":
+        # Geometry, stated once: the depth grid is a *crop* of a uniformly
+        # resized image. A depth pixel ``(u, v)`` therefore sits at render pixel
+        # ``((u + left) * W / resized_w, (v + top) * H / resized_h)`` -- the crop
+        # offset is *added* before scaling, because the crop removed pixels from
+        # the left/top of the resized frame.
+        #
+        # The scale is ``render / resized``, not ``render / depth``: dividing by
+        # the depth grid would fold the cropped-away rows into the scale and
+        # reintroduce exactly the anisotropy this branch exists to remove.
+        if crop_offset is not None and len(crop_offset) >= 4:
+            left, top, resized_w, resized_h = (int(v) for v in crop_offset[:4])
+            sx = float(tw) / float(resized_w)
+            sy = float(th) / float(resized_h)
+            out = np.array(K, dtype=np.float64, copy=True)
+            out[0, :] *= sx
+            out[1, :] *= sy
+            out[0, 2] = (K[0, 2] + left) * sx
+            out[1, 2] = (K[1, 2] + top) * sy
+            notes.append(
+                f"  {name}: depth {fw}x{fh} is a crop of a uniform resize of "
+                f"{tw}x{th} (sx={sx:.6f} sy={sy:.6f}, crop {left},{top}); "
+                "K rescaled, principal point de-cropped"
+            )
+            return out
+        # No geometry recorded: fall back to the isotropic ratio, which is exact
+        # when the crop happens to be symmetric and zero, and close otherwise.
+        sx = sy = float(tw) / float(fw)
+        out = np.array(K, dtype=np.float64, copy=True)
+        out[0, :] *= sx
+        out[1, :] *= sy
+        notes.append(
+            f"  {name}: depth {fw}x{fh} -> {tw}x{th} assumed isotropic; the "
+            "bundle records no crop geometry, so a real crop would be missed"
+        )
+        return out
+
+    sx = float(tw) / float(fw)
+    sy = float(th) / float(fh)
     if abs(sx - sy) > 1e-3:
         notes.append(
             f"  {name}: depth/image aspect differs "

@@ -260,6 +260,27 @@ class BundleWriter:
     source: str
     image_grid: Tuple[int, int]
     depth_grid: Optional[Tuple[int, int]] = None
+    #: How ``depths/`` was derived from ``images/``. Two numbers cannot express
+    #: this: Scal3R resizes the image *uniformly* until it covers the target and
+    #: then centre-crops, so ``depth_grid`` is a crop of a uniform resize, not a
+    #: per-axis scale of the image. Without this field the two are
+    #: indistinguishable from the grids alone, and a reader that assumes per-axis
+    #: scaling produces an anisotropic K -- measured -3.6% on fy for the
+    #: 1297x840 -> 518x322 garden case.
+    #:
+    #: ``None`` means "unknown; assume per-axis resize" (the historical
+    #: behaviour). ``"resize"`` means the depth grid is the image grid resized,
+    #: possibly non-uniformly, with no crop. ``"cover"`` means uniform
+    #: resize-to-cover followed by a centre crop, and ``crop_offset`` records the
+    #: crop's top-left corner in the resized frame (defaults to centred).
+    depth_resample: Optional[str] = None
+    #: ``(left, top, resized_w, resized_h)`` for ``depth_resample="cover"``:
+    #: the crop's top-left corner plus the *pre-crop* grid it was taken from.
+    #: The pre-crop size is needed because ``(fw, fh)`` alone cannot fix the
+    #: scale -- Scal3R aligns its resized size to 14 px, so sx and sy differ in
+    #: the fourth decimal and using the horizontal one for both axes shifts the
+    #: principal point by the wrong amount.
+    depth_crop_offset: Optional[Tuple[int, int, int, int]] = None
     camera_convention: str = "opencv"
     pose_convention: str = "c2w"
     depth_kind: str = "z"
@@ -407,6 +428,10 @@ class BundleWriter:
             "source": self.source,
             "image_grid": list(self.image_grid),
             "depth_grid": list(self.depth_grid) if self.depth_grid else None,
+            "depth_resample": self.depth_resample,
+            "depth_crop_offset": (
+                list(self.depth_crop_offset) if self.depth_crop_offset else None
+            ),
             "camera_convention": self.camera_convention,
             "pose_convention": self.pose_convention,
             "depth_kind": self.depth_kind,
@@ -440,6 +465,12 @@ class LoadedBundle:
     Ks: np.ndarray              # [N,3,3], defined on ``depth_grid``
     cam_to_world: np.ndarray    # [N,4,4]
     depth_scales: np.ndarray    # [N] per-frame multiplier (1.0 when unset)
+
+    #: How the depth grid relates to the image grid; see ``BundleWriter``.
+    #: ``None`` for bundles written before the field existed, in which case the
+    #: caller must assume a plain per-axis resize (the old behaviour).
+    depth_resample: Optional[str] = None
+    depth_crop_offset: Optional[Tuple[int, int, int, int]] = None
 
     @property
     def has_depth(self) -> bool:
@@ -476,6 +507,18 @@ def read_bundle(path: str | Path) -> LoadedBundle:
     if not frames:
         raise ValueError(f"{mpath}: bundle has no frames")
 
+    # Validated before touching the filesystem: this is a statement about the
+    # format, and reporting a missing image first would hide the real problem
+    # behind an unrelated error.
+    resample = manifest.get("depth_resample")
+    crop = manifest.get("depth_crop_offset")
+    if resample is not None and resample not in ("resize", "cover"):
+        raise ValueError(
+            f"{mpath}: unknown depth_resample {resample!r}; expected 'resize' or "
+            "'cover'. A wrong value here silently mislocates every depth pixel, "
+            "so it is refused rather than guessed."
+        )
+
     names, imgs, deps, Ks, c2ws, scales = [], [], [], [], [], []
     for fr in frames:
         names.append(str(fr["name"]))
@@ -500,6 +543,8 @@ def read_bundle(path: str | Path) -> LoadedBundle:
         manifest=manifest,
         image_grid=(int(ig[0]), int(ig[1])) if ig else (0, 0),
         depth_grid=(int(dg[0]), int(dg[1])) if dg else None,
+        depth_resample=resample,
+        depth_crop_offset=tuple(int(v) for v in crop) if crop else None,
         names=names,
         image_paths=imgs,
         depth_paths=deps,
@@ -512,6 +557,52 @@ def read_bundle(path: str | Path) -> LoadedBundle:
 # --------------------------------------------------------------------------
 # Adapters
 # --------------------------------------------------------------------------
+def scal3r_crop_geometry(
+    image_w: int,
+    image_h: int,
+    *,
+    proc_max_size: int = 518,
+    proc_align_size: int = 14,
+    center_crop: bool = True,
+) -> Tuple[int, int, int, int]:
+    """Replicate Scal3R's resize+crop to get ``(left, top, resized_w, resized_h)``.
+
+    Mirrors ``determine_target_size`` + ``resize_to_cover`` + the centred crop in
+    ``surfel``'s own code, so the bundle can state exactly how its depth grid
+    relates to its images instead of leaving a reader to guess.
+
+    Three details are reproduced because each changes the answer:
+
+    * the target height is ``int(aspect * proc_max_size)`` then floored to a
+      multiple of ``proc_align_size`` -- for 1297x840 that is 322, not 336;
+    * ``resize_to_cover`` uses ``max`` of the two ratios and then rounds the
+      *resized* size to ``proc_align_size``, which makes sx and sy differ
+      slightly (0.399383 vs 0.400000 on garden);
+    * the crop is centred by integer division, so an odd remainder drops the
+      extra pixel from the bottom/right.
+
+    Verified against Scal3R's actual pipeline for garden 1297x840 -> 518x322
+    (resized 518x336, crop top=7).
+    """
+    align = max(1, int(proc_align_size))
+    if proc_max_size > 0:
+        target_h = int((image_h / image_w) * proc_max_size)
+        target_w = int(proc_max_size)
+    else:
+        target_h, target_w = int(image_h), int(image_w)
+    target_h = max(align, target_h // align * align)
+    target_w = max(align, target_w // align * align)
+
+    ratio = max(target_h / max(image_h, 1), target_w / max(image_w, 1))
+    resized_h = max(align, round(image_h * ratio / align) * align)
+    resized_w = max(align, round(image_w * ratio / align) * align)
+
+    left = (resized_w - target_w) // 2 if center_crop else 0
+    top = (resized_h - target_h) // 2 if center_crop else 0
+    # Scal3R crops to (target_h, target_w), which is the depth grid.
+    return int(left), int(top), int(resized_w), int(resized_h)
+
+
 def export_scal3r(
     run_dir: str | Path,
     out_dir: str | Path,
@@ -520,6 +611,9 @@ def export_scal3r(
     depth_dir: Optional[str | Path] = None,
     depth_suffix: Optional[str] = None,
     depth_format: str = "exr",
+    proc_max_size: int = 518,
+    proc_align_size: int = 14,
+    center_crop: bool = True,
     notes: Optional[Sequence[str]] = None,
 ) -> Path:
     """Convert a Scal3R run directory into a bundle.
@@ -632,11 +726,28 @@ def export_scal3r(
 
             with Image.open(img) as im:
                 iw, ih = im.size
+            geom = scal3r_crop_geometry(
+                int(iw),
+                int(ih),
+                proc_max_size=proc_max_size,
+                proc_align_size=proc_align_size,
+                center_crop=center_crop,
+            )
             writer = BundleWriter(
                 root=Path(out_dir),
                 source="scal3r",
                 image_grid=(int(iw), int(ih)),
                 depth_format=depth_format,
+                # Scal3R builds its input as ``resize_to_cover`` (uniform) then
+                # ``crop_nhwc_image`` (centre crop, ``center_crop=True`` by
+                # default). Recording the *measured* geometry -- rather than
+                # letting the reader infer it from two grid sizes -- is what
+                # makes the inverse exact: the resized grid is aligned to
+                # ``proc_align_size``, so its vertical scale differs from the
+                # horizontal one in the fourth decimal and the crop is not
+                # necessarily centred on an integer pixel.
+                depth_resample="cover",
+                depth_crop_offset=geom,
                 gauge={
                     "kind": "similarity",
                     "scale": 1.0,
