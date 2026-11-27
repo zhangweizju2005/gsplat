@@ -88,6 +88,13 @@ class Trainer:
         self.step = 0
         self.metrics: List[TrainMetrics] = []
 
+        # Seed everything the run touches, *before* any model construction.
+        # ``train.seed`` used to be read only by the DGI/kNN samplers, so the
+        # quaternion initialisation (``torch.rand``) and the densification's
+        # random split/duplicate sampling were never seeded: two "identical"
+        # runs differed, and a resume could not reproduce an uninterrupted one.
+        _seed_everything(self.cfg.train.seed)
+
         self._setup_dirs()
         self._setup_data()
         self._setup_model()
@@ -227,6 +234,9 @@ class Trainer:
             device=self.device,
         )
         self.params = init.to_parameter_dict()
+        # Kept so resume can rebuild optimisers at the checkpoint's parameter
+        # count with the same learning rates (see load()).
+        self.init = init
         self.optimizers = build_optimizers(
             init, batch_size=self.cfg.train.batch_size, device=self.device
         )
@@ -627,6 +637,17 @@ class Trainer:
             # pruning) is empty. Serialising it here makes resume equivalent to an
             # uninterrupted run.
             "strategy_state": _serialise_strategy_state(self.strategy_state),
+            # Optimiser momenta and the *current* LRs. Without these a resume
+            # restarts Adam from zero and, worse, re-seeds the means LR from its
+            # initial value instead of continuing the decay -- two resumptions
+            # of the same run then follow different trajectories.
+            "optimizer_state": {
+                name: opt.state_dict() for name, opt in self.optimizers.items()
+            },
+            "lrs": {
+                name: opt.param_groups[0]["lr"]
+                for name, opt in self.optimizers.items()
+            },
             "config": self.cfg.to_dict(),
             "scene_scale": self.scene_scale,
             "depth_scale": self.depth_scale,
@@ -650,16 +671,82 @@ class Trainer:
         return path
 
     def load(self, path: str | Path) -> Dict[str, Any]:
+        """Restore parameters, step counter and strategy state.
+
+        Every restored parameter is written *in place*, which is the whole
+        point: the optimisers built in ``_setup_model`` hold references to the
+        exact ``Parameter`` objects created there, and so does the strategy.
+        A previous version replaced ``self.params[k]`` with a new
+        ``Parameter`` whenever the checkpoint's shape differed from the freshly
+        initialised model's. That is the normal case for any densified run, and
+        it silently froze training: ``optimizer.step()`` kept updating the
+        *orphaned* tensors, ``loss`` and every logged metric kept looking
+        normal, and the live model never changed. Nothing raised, which is why
+        it went unnoticed until a resume was instrumented.
+
+        So the shape differences are absorbed by resizing the existing storage
+        rather than replacing the object (see :func:`_resize_parameter`), and
+        the optimiser references are verified afterwards. If a resume still
+        cannot be wired up, this raises instead of training a frozen model.
+        """
         payload = torch.load(path, map_location=self.device, weights_only=False)
+        resized = False
         for k, v in payload["params"].items():
-            if k in self.params and self.params[k].shape == v.shape:
-                self.params[k].data.copy_(v.to(self.device))
-            else:
-                self.params[k] = torch.nn.Parameter(v.to(self.device))
+            v = v.detach().to(self.device)
+            if k not in self.params:
+                self.params[k] = torch.nn.Parameter(v)
+                resized = True
+                continue
+            if tuple(self.params[k].data.shape) != tuple(v.shape):
+                resized = True
+            _resize_parameter(self.params[k], v)
+        if resized:
+            # The moment tensors are shaped by the parameter count, so they cannot
+            # be loaded wholesale. They are rebuildable in prefix though: the
+            # first ``n`` rows of a checkpoint's state still describe the first
+            # ``n`` Gaussians, and that is exactly which rows survive a resume
+            # that starts from a smaller initial cloud. Discarding them would
+            # restart Adam on the majority of the model for no reason.
+            #
+            # The rebuild must wrap the *current* ``self.params``: passing the
+            # original ``self.init`` builds Adam over the initialisation tensors,
+            # which after a resize are neither the live objects nor the live
+            # shape, and the next densification then fails with a shape mismatch
+            # between a 6522-row gradient and a 3783-row moment.
+            saved_state = payload.get("optimizer_state")
+            self.optimizers = _rebuild_optimizers(
+                self.params,
+                self.init.lrs,
+                batch_size=self.cfg.train.batch_size,
+                device=self.device,
+            )
+            migrated = _migrate_optimizer_state_prefix(
+                self.optimizers, saved_state, self.params
+            )
+            if saved_state is not None:
+                self._emit(
+                    "resume       : parameter count changed "
+                    f"({len(payload['params']['means'])} saved -> "
+                    f"{len(self.params['means'])} live); Adam momenta migrated for "
+                    f"{migrated} row(s), fresh beyond that"
+                )
+        else:
+            opt_state = payload.get("optimizer_state")
+            if opt_state is not None:
+                _restore_optimizer_state(self.optimizers, opt_state)
+            lrs = payload.get("lrs")
+            if lrs:
+                for name, lr in lrs.items():
+                    if name in self.optimizers:
+                        self.optimizers[name].param_groups[0]["lr"] = float(lr)
+
         self.step = int(payload.get("step", 0))
         state = payload.get("strategy_state")
         if state is not None:
             _restore_strategy_state(self.strategy_state, state, self.device)
+        # An optimiser that no longer points at a live parameter is a silent
+        # no-op, so this is checked rather than assumed.
+        _assert_optimizers_track_params(self.params, self.optimizers)
         return payload
 
     # ------------------------------------------------------------------
@@ -667,6 +754,19 @@ class Trainer:
     # ------------------------------------------------------------------
     def fit(self) -> Dict[str, float]:
         cfg = self.cfg
+        # ``generator`` makes the shuffling reproducible from ``train.seed``, and
+        # -- because it is a *named* generator -- it can be fast-forwarded on
+        # resume so the batch order continues where the previous leg stopped.
+        # Without the fast-forward a resumed run draws from the start of the
+        # permutation again, which is why a resumed trajectory differed from the
+        # uninterrupted one even with identical parameters and LRs.
+        gen = torch.Generator()
+        gen.manual_seed(int(cfg.train.seed))
+        skip = 0
+        if self.step > 0:
+            skip = _fast_forward_loader(
+                gen, len(self.trainset), cfg.train.batch_size, self.step
+            )
         loader = torch.utils.data.DataLoader(
             self.trainset,
             batch_size=cfg.train.batch_size,
@@ -674,8 +774,16 @@ class Trainer:
             num_workers=0,
             collate_fn=collate,
             drop_last=False,
+            generator=gen,
         )
         it = iter(loader)
+        # Mid-epoch resumes: the generator is positioned at the start of the
+        # epoch that contains ``self.step``, so consume the batches already seen.
+        for _ in range(skip):
+            try:
+                next(it)
+            except StopIteration:  # pragma: no cover - skip is always < per_epoch
+                break
         eval_steps = set(cfg.train.eval_steps)
         save_steps = set(cfg.train.save_steps)
         last_val: Dict[str, float] = {}
@@ -746,6 +854,214 @@ def _serialise_strategy_state(state: Any) -> Optional[Dict[str, Any]]:
         # Anything else (closures, references) is intentionally skipped: it
         # cannot be restored meaningfully and would make the checkpoint fragile.
     return out
+
+
+def _seed_everything(seed: int) -> None:
+    """Make a run reproducible from ``train.seed``.
+
+    All three RNGs matter and none were previously seeded:
+
+    * ``torch`` -- ``create_splats_2dgs`` draws ``quats`` with ``torch.rand``,
+      and gsplat's split/duplicate ops sample with ``torch.randn``;
+    * ``numpy`` -- DGI subsampling, the kNN cap, and gauge quantile sampling;
+    * ``random`` -- used indirectly by some library paths.
+
+    ``PYTHONHASHSEED`` cannot be set after interpreter start, so dict ordering
+    is only reproducible when the process is launched with it already set; that
+    is documented rather than silently assumed.
+    """
+    import random
+
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _fast_forward_loader(
+    gen: torch.Generator, n_items: int, batch_size: int, steps: int
+) -> int:
+    """Position a shuffle generator at the epoch containing ``steps``.
+
+    ``DataLoader(shuffle=True, generator=g)`` draws one permutation per epoch
+    (``torch.randperm(n, generator=g)``) and consumes ``per_epoch =
+    ceil(n / batch_size)`` batches from it before drawing the next. To make a
+    resumed run see the same batch order the uninterrupted run would have seen,
+    the generator must be advanced past the permutations of the *completed*
+    epochs, and the caller must then skip the batches already consumed inside
+    the current epoch.
+
+    Returns the number of batches to skip.
+    """
+    if steps <= 0 or n_items <= 0:
+        return 0
+    per_epoch = max(1, math.ceil(n_items / max(1, batch_size)))
+    completed_epochs = int(steps) // per_epoch
+    for _ in range(completed_epochs):
+        torch.randperm(n_items, generator=gen)
+    return int(steps) % per_epoch
+
+
+def _rebuild_optimizers(
+    params: Dict[str, torch.nn.Parameter],
+    lrs: Dict[str, float],
+    *,
+    batch_size: int,
+    device,
+) -> Dict[str, torch.optim.Optimizer]:
+    """Build optimisers over *existing* parameter objects.
+
+    :func:`~surfel.model.splats.build_optimizers` takes a ``SplatInit`` and wraps
+    the tensors it holds. On resume the live tensors are the ones in
+    ``self.params`` (possibly resized by a checkpoint), so the optimizer must be
+    constructed from those identities, not from the original initialisation.
+    The batch-size scaling is gsplat's convention and is reproduced exactly as
+    ``build_optimizers`` does it.
+    """
+    import math as _math
+
+    sqrt_b = _math.sqrt(batch_size)
+    optimizers: Dict[str, torch.optim.Optimizer] = {}
+    for name, param in params.items():
+        optimizers[name] = torch.optim.Adam(
+            [{"params": param, "lr": float(lrs[name]) * sqrt_b}],
+            eps=1e-15 / sqrt_b,
+            betas=(1 - batch_size * (1 - 0.9), 1 - batch_size * (1 - 0.999)),
+        )
+    return optimizers
+
+
+def _restore_optimizer_state(
+    optimizers: Dict[str, torch.optim.Optimizer],
+    saved: Dict[str, Any],
+) -> None:
+    """Load Adam momenta, tolerating a size change in an individual group.
+
+    ``load_state_dict`` raises when the tensor shapes disagree, and a strategy
+    may have changed only *one* parameter's count. Per-optimiser guarding keeps
+    the restorable groups restorable instead of discarding all of them.
+    """
+    for name, opt in optimizers.items():
+        state = saved.get(name)
+        if state is None:
+            continue
+        try:
+            opt.load_state_dict(state)
+        except (ValueError, KeyError) as exc:
+            # Reported rather than swallowed: the caller decides whether a
+            # restarted momentum is acceptable.
+            print(
+                f"WARNING: could not restore optimizer[{name!r}] state ({exc}); "
+                "its momenta restart from zero"
+            )
+
+
+def _migrate_optimizer_state_prefix(
+    optimizers: Dict[str, torch.optim.Optimizer],
+    saved: Optional[Dict[str, Any]],
+    params: Dict[str, torch.nn.Parameter],
+) -> int:
+    """Carry over the leading rows of a saved optimiser state.
+
+    Adam's ``exp_avg`` / ``exp_avg_sq`` / ``step`` describe Gaussians, so a
+    resume into a differently sized model cannot load them wholesale -- but the
+    first ``min(saved_n, live_n)`` rows are still valid, because the checkpoint
+    and the live model share their ``min`` prefix (the live model was
+    initialised from the same cloud and then grew, or the checkpoint grew).
+    Rows beyond that start at zero, which is the same state a new Gaussian has.
+
+    Returns the number of rows migrated, for the resume log line.
+    """
+    if not saved:
+        return 0
+    migrated = 0
+    for name, opt in optimizers.items():
+        state = saved.get(name)
+        if not state:
+            continue
+        live_param = opt.param_groups[0]["params"][0]
+        live_n = int(live_param.shape[0])
+        per_param = state.get("state", {})
+        for saved_idx, saved_state in per_param.items():
+            rows = {
+                k: v
+                for k, v in saved_state.items()
+                if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] <= live_n
+            }
+            if not rows:
+                continue
+            n = min(int(next(iter(rows.values())).shape[0]), live_n)
+            new_state: Dict[str, Any] = {}
+            for k, v in saved_state.items():
+                if k in rows:
+                    # Pad to the full live length: Adam requires the moment to
+                    # match the parameter's shape exactly, and the tail rows are
+                    # Gaussians the checkpoint never saw.
+                    full = torch.zeros(
+                        (live_n, *v.shape[1:]), dtype=v.dtype, device=live_param.device
+                    )
+                    full[:n] = v[:n].to(live_param.device)
+                    new_state[k] = full
+                elif isinstance(v, torch.Tensor):
+                    # Scalars shaped like the parameter count (none today) or
+                    # genuinely scalar (``step``); keep scalars as-is.
+                    new_state[k] = v.to(live_param.device).clone()
+                else:
+                    new_state[k] = v
+            opt.state[live_param] = new_state
+            migrated = max(migrated, n)
+    return migrated
+
+
+def _resize_parameter(param: torch.nn.Parameter, value: torch.Tensor) -> None:
+    """Write ``value`` into ``param`` while keeping the *object* alive.
+
+    ``param.data = ...`` replaces the storage but not the ``Parameter``, so
+    every holder of a reference -- the renderer's ``params`` dict, the
+    densification strategy, and the optimiser's ``param_groups`` -- keeps
+    pointing at a live tensor. Replacing ``self.params[k]`` with a new
+    ``Parameter`` instead is what froze resumed runs: the optimiser kept
+    updating an orphan.
+    """
+    if tuple(param.data.shape) == tuple(value.shape):
+        param.data.copy_(value)
+    else:
+        # Densification changed the count. A fresh storage of the checkpoint's
+        # shape is required; the optimiser state cannot be reused for it, which
+        # is why load() rebuilds the optimisers afterwards.
+        param.data = value.detach().clone()
+
+
+def _assert_optimizers_track_params(
+    params: Dict[str, torch.nn.Parameter],
+    optimizers: Dict[str, torch.optim.Optimizer],
+) -> None:
+    """Fail loudly if an optimiser no longer points at the live parameters.
+
+    This is the gate for the failure mode that made resume silent: an optimiser
+    holding an orphaned tensor still runs, still reports a loss, and updates
+    nothing that is rendered. Identity is the only thing that distinguishes the
+    two cases, so it is compared directly.
+    """
+    for name, opt in optimizers.items():
+        live = params.get(name)
+        if live is None:
+            continue
+        tracked = opt.param_groups[0]["params"]
+        if len(tracked) != 1 or tracked[0] is not live:
+            raise RuntimeError(
+                f"optimizer[{name!r}] does not track the live parameter (it holds "
+                f"{len(tracked)} tensor(s), identity match failed). Training would "
+                "run and log normally while never updating the model."
+            )
+        if tuple(opt.param_groups[0]["params"][0].shape) != tuple(live.shape):
+            raise RuntimeError(
+                f"optimizer[{name!r}] tracks a parameter of shape "
+                f"{tuple(opt.param_groups[0]['params'][0].shape)} but the live one "
+                f"is {tuple(live.shape)}"
+            )
 
 
 def _restore_strategy_state(state: Dict[str, Any], saved: Dict[str, Any], device) -> None:

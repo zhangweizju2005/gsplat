@@ -914,3 +914,377 @@ def test_every_real_profile_states_a_gauge_free_means_lr():
             f"{cfg.train.lr.means_per_spacing}, outside the measured-usable band "
             "(0.003-0.030; 0.1 measured 2 dB worse)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Resume: the silent-freeze gate
+# ---------------------------------------------------------------------------
+def _resume_fixture(tmp_path: Path, *, n_frames: int = 8):
+    """A Trainer-sized config plus its split, small enough to run on a GPU."""
+    from surfel.config.profiles import make_profile_config
+
+    root = tmp_path / "scene"
+    make_synthetic_colmap(root, n_frames=n_frames, width=64, height=48)
+
+    cfg = make_profile_config("smoke")
+    cfg.data.path = str(root)
+    cfg.data.split_mode = "experiment"
+    cfg.data.eval_ratio = 0.25
+    cfg.data.depth.enabled = True
+    cfg.data.depth.dir = "depths"
+    cfg.data.depth.weight = 0.05
+    cfg.gauge.scale_source = "extent"
+    cfg.model.sh_degree = 0
+    cfg.train.max_steps = 10
+    cfg.train.eval_steps = []
+    cfg.train.save_steps = []
+    cfg.train.lr.decay_means = False
+    cfg.train.out_dir = str(tmp_path / "out")
+    cfg.validate()
+    split, _ = parse_colmap(cfg)
+    return cfg, split
+
+
+def test_resume_updates_the_live_model(tmp_path: Path):
+    """A resumed ``optimizer.step()`` must move the parameters that get rendered.
+
+    This is the gate for the worst bug found in this project's history. ``load()``
+    used to do ``self.params[k] = nn.Parameter(v)`` whenever the checkpoint's
+    shape differed from the freshly initialised model -- which is the normal case
+    for any densified run. The optimisers still referenced the *old* tensors, so
+    every subsequent ``opt.step()`` updated an orphan: the loss fell, the metrics
+    looked healthy, and the model never changed. Measured pre-fix: ``max|delta|``
+    in ``means`` after a step was exactly 0, with 1,948,050 vs 3,344,212 rows.
+
+    A test that only checks "resume does not crash" passes on that bug, so the
+    assertion here is on the *observable effect* of a step on the live tensor.
+    """
+    from surfel.train import Trainer
+
+    cfg, split = _resume_fixture(tmp_path)
+    tr = Trainer(cfg, split, log_fn=None)
+
+    # Take the checkpoint *after* densification has grown the model, which is
+    # the real resume case and the one that used to hit the replacement branch.
+    n0 = len(tr.params["means"])
+    extra = 3
+    for name, param in tr.params.items():
+        if param.dim() >= 1 and param.shape[0] == n0:
+            tail = param.data[-1:].expand(extra, *param.shape[1:])
+            param.data = torch.cat([param.data, tail], 0).contiguous()
+    assert len(tr.params["means"]) == n0 + extra
+
+    # Keep the optimisers consistent with the grown tensors, as the live run's
+    # strategy would have left them.
+    for name, opt in tr.optimizers.items():
+        live = tr.params[name]
+        opt.param_groups[0]["params"] = [live]
+        opt.state.clear()
+    tr.step = 7
+    ckpt = tr.save(tmp_path / "ckpt.pt")
+
+    # A fresh trainer starts from the scene's *initial* point count, i.e. smaller
+    # than the checkpoint. This is exactly the mismatch that froze resumed runs.
+    tr2 = Trainer(cfg, split, log_fn=None)
+    assert len(tr2.params["means"]) == n0, "fixture assumption: trainer restarts at n0"
+
+    tr2.load(ckpt)
+    assert len(tr2.params["means"]) == n0 + extra, (
+        "load() did not adopt the checkpoint's parameter count"
+    )
+    assert tr2.step == 7
+
+    # The real assertion: a step must move the tensors the renderer reads.
+    live_before = {k: v.detach().clone() for k, v in tr2.params.items()}
+    for name, param in tr2.params.items():
+        param.grad = torch.ones_like(param)
+    for opt in tr2.optimizers.values():
+        opt.step()
+    moved = {
+        k: float((tr2.params[k].detach() - live_before[k]).abs().max())
+        for k in tr2.params
+    }
+
+    assert max(moved.values()) > 0.0, (
+        "resume left every parameter frozen after optimizer.step(); the optimiser "
+        f"is not tracking the live tensors (per-parameter max|delta|: {moved})"
+    )
+    # And the optimiser really is connected to the object that renders.
+    for name, opt in tr2.optimizers.items():
+        tracked = opt.param_groups[0]["params"][0]
+        assert tracked is tr2.params[name], (
+            f"optimizer[{name!r}] does not hold the live parameter object"
+        )
+
+
+def test_resume_restores_the_learning_rate_not_its_initial_value(tmp_path: Path):
+    """Resume must continue the means decay rather than re-seed it.
+
+    The scheduler is built from ``means_final_ratio`` at construction, so a
+    resumed run whose LR was not restored would silently restart the decay from
+    its initial value: two resumptions of one run follow different trajectories,
+    and the resumed run can never match the uninterrupted one.
+    """
+    from surfel.train import Trainer
+
+    cfg, split = _resume_fixture(tmp_path)
+    cfg.train.lr.decay_means = True
+    cfg.train.lr.means_final_ratio = 0.01
+    tr = Trainer(cfg, split, log_fn=None)
+
+    # Advance the schedule part-way, as a real run would have.
+    tr.step = 5
+    tr.means_lr_step(5)
+    decayed = tr.optimizers["means"].param_groups[0]["lr"]
+    initial = tr.init.lrs["means"] * cfg.train.batch_size ** 0.5
+    assert decayed < initial, "the schedule did not lower the means LR; test setup is wrong"
+
+    ckpt = tr.save(tmp_path / "ckpt.pt")
+
+    tr2 = Trainer(cfg, split, log_fn=None)
+    tr2.load(ckpt)
+    restored = tr2.optimizers["means"].param_groups[0]["lr"]
+    assert abs(restored - decayed) / decayed < 1e-6, (
+        f"resume restored means LR {restored:.6g} but the checkpoint held "
+        f"{decayed:.6g}; the decay restarted from {initial:.6g}"
+    )
+    assert tr2.step == 5
+
+
+def test_resume_is_refused_when_optimizers_detach(tmp_path: Path):
+    """The guard itself must fire, not just the happy path.
+
+    A future refactor that replaces a ``Parameter`` again would otherwise pass
+    every other test in this file.
+    """
+    from surfel.train import Trainer
+
+    cfg, split = _resume_fixture(tmp_path)
+    tr = Trainer(cfg, split, log_fn=None)
+    ckpt = tr.save(tmp_path / "ckpt.pt")
+
+    tr2 = Trainer(cfg, split, log_fn=None)
+    # Poison one optimiser so it holds a tensor that is not the live parameter.
+    live = tr2.params["means"]
+    orphan = torch.nn.Parameter(live.detach().clone())
+    tr2.optimizers["means"] = torch.optim.Adam([orphan], lr=1e-5)
+
+    with pytest.raises(RuntimeError, match="does not track the live parameter"):
+        tr2.load(ckpt)
+
+
+def test_seed_makes_two_runs_initialise_identically(tmp_path: Path):
+    """``train.seed`` must reach torch, not only the numpy samplers.
+
+    Before this, ``torch.rand`` (which initialises every quaternion) was never
+    seeded: two runs with the same config produced different initial models, so
+    "reproducible to +/-0.01 dB" was luck rather than a property. Any A/B that
+    relies on run-to-run determinism depends on this.
+    """
+    from surfel.train import Trainer
+
+    cfg, split = _resume_fixture(tmp_path)
+    tr_a = Trainer(cfg, split, log_fn=None)
+    quats_a = tr_a.params["quats"].detach().clone()
+
+    tr_b = Trainer(cfg, split, log_fn=None)
+    quats_b = tr_b.params["quats"].detach().clone()
+
+    assert torch.equal(quats_a, quats_b), (
+        "two Trainers with the same train.seed produced different quaternions, "
+        "so torch's RNG is still unseeded"
+    )
+
+    cfg2, _ = _resume_fixture(tmp_path / "other")
+    cfg2.train.seed = cfg.train.seed + 1
+    cfg2.train.out_dir = str(tmp_path / "out2")
+    tr_c = Trainer(cfg2, split, log_fn=None)
+    assert not torch.equal(quats_a, tr_c.params["quats"].detach()), (
+        "a different seed produced identical quaternions; the seed is not being applied"
+    )
+
+
+def test_resume_migrates_optimizer_momenta_by_prefix(tmp_path: Path):
+    """A size change must keep the moment rows it can, not discard all of them.
+
+    Rebuilding Adam from scratch on every densified resume costs the whole model
+    its momentum, which matters most exactly where it is hardest to notice: a
+    7k-step run resumed at 3.3M Gaussians would restart the optimiser on all of
+    them. The saved rows describe the first ``min(saved_n, live_n)`` Gaussians,
+    which is a real prefix of the live model, so they are carried over and only
+    the tail starts at zero.
+    """
+    from surfel.train.trainer import _migrate_optimizer_state_prefix
+
+    live = torch.nn.Parameter(torch.zeros(4, 3))
+    opt = torch.optim.Adam([{"params": live, "lr": 1e-3}])
+    saved = {
+        "means": {
+            "state": {
+                0: {
+                    "step": torch.tensor(5.0),
+                    "exp_avg": torch.full((3, 3), 7.0),
+                    "exp_avg_sq": torch.full((3, 3), 9.0),
+                }
+            },
+            "param_groups": [{"lr": 1e-3, "params": [0]}],
+        }
+    }
+
+    migrated = _migrate_optimizer_state_prefix({"means": opt}, saved, {"means": live})
+
+    assert migrated == 3, f"expected 3 rows migrated, got {migrated}"
+    state = opt.state[live]
+    assert tuple(state["exp_avg"].shape) == (4, 3)
+    # The first three rows carry the checkpoint's values; the fourth is fresh.
+    assert torch.allclose(state["exp_avg"][:3], torch.full((3, 3), 7.0))
+    assert torch.allclose(state["exp_avg"][3], torch.zeros(3))
+    assert torch.allclose(state["exp_avg_sq"][:3], torch.full((3, 3), 9.0))
+    assert torch.allclose(state["exp_avg_sq"][3], torch.zeros(3))
+
+
+def test_resume_rebuilds_optimizers_at_the_live_parameter_objects(tmp_path: Path):
+    """Rebuilding must wrap ``self.params``, not the original initialisation.
+
+    Passing ``self.init`` here was a real intermediate bug: it produced Adam over
+    the initialisation tensors, so after the first densification the gradient had
+    6522 rows and the moment 3783, failing inside the CUDA optimiser with a
+    device-side assert.
+    """
+    from surfel.train.trainer import _rebuild_optimizers
+
+    params = {
+        "means": torch.nn.Parameter(torch.zeros(5, 3)),
+        "quats": torch.nn.Parameter(torch.zeros(5, 4)),
+    }
+    lrs = {"means": 1e-4, "quats": 1e-3}
+
+    opts = _rebuild_optimizers(params, lrs, batch_size=1, device="cpu")
+
+    for name, opt in opts.items():
+        tracked = opt.param_groups[0]["params"][0]
+        assert tracked is params[name], f"{name}: optimiser built over a different tensor"
+        assert tracked.shape == params[name].shape
+
+
+def test_resume_replays_the_same_batch_order(tmp_path: Path):
+    """The resumed leg must see the batches the uninterrupted run would have.
+
+    Matching parameters and LRs is not enough: ``DataLoader(shuffle=True)``
+    draws one permutation per epoch from a generator, so a resume that rebuilt
+    the loader from the start replayed epoch 0 instead of continuing. Measured
+    effect before the fix: 2.9e-05 max parameter difference on an otherwise
+    identical 16-step run; after it, 7.5e-09 (pure floating-point summation
+    order).
+    """
+    from surfel.train.trainer import _fast_forward_loader
+
+    n_items, batch_size, steps = 10, 1, 23
+    per_epoch = 10  # ceil(10 / 1)
+
+    gen = torch.Generator()
+    gen.manual_seed(1234)
+    skip = _fast_forward_loader(gen, n_items, batch_size, steps)
+
+    # Two completed epochs, then the 3rd batch of the current epoch.
+    assert skip == steps % per_epoch == 3
+
+    # The generator must now agree with one that drew those two permutations.
+    reference = torch.Generator()
+    reference.manual_seed(1234)
+    for _ in range(steps // per_epoch):
+        torch.randperm(n_items, generator=reference)
+    assert torch.equal(
+        torch.randperm(n_items, generator=gen),
+        torch.randperm(n_items, generator=reference),
+    ), "fast-forward drew the wrong number of permutations"
+
+
+def test_resume_matches_an_uninterrupted_run(tmp_path: Path):
+    """End-to-end: interrupt at step 8, resume, and compare with one 16-step run.
+
+    This is the assertion the whole P0 fix exists for. It combines the three
+    pieces that each failed separately -- parameter identity, LR restoration and
+    batch order -- so a regression in any one of them shows up here.
+    """
+    from surfel.train import Trainer
+    from surfel.data.dataset import collate
+    from surfel.config.profiles import make_profile_config
+
+    root = tmp_path / "scene"
+    make_synthetic_colmap(root, n_frames=10, width=96, height=72)
+
+    def build(max_steps: int, name: str):
+        cfg = make_profile_config("smoke")
+        cfg.data.path = str(root)
+        cfg.data.split_mode = "experiment"
+        cfg.gauge.scale_source = "extent"
+        cfg.data.depth.enabled = True
+        cfg.data.depth.dir = "depths"
+        cfg.data.depth.weight = 0.05
+        cfg.model.sh_degree = 0
+        cfg.train.max_steps = max_steps
+        cfg.train.eval_steps = []
+        cfg.train.save_steps = []
+        # Keep the run out of the densification window: those are legitimate
+        # changes to the model, the opposite of what this test checks.
+        cfg.density.refine_start_iter = 1_000_000
+        cfg.density.refine_stop_iter = 2_000_000
+        cfg.train.lr.decay_means = True
+        cfg.train.lr.means_final_ratio = 0.01
+        cfg.train.seed = 7
+        cfg.train.out_dir = str(tmp_path / name)
+        cfg.validate()
+        return cfg
+
+    cfg_all = build(16, "all")
+    split_all, _ = parse_colmap(cfg_all)
+    uninterrupted = Trainer(cfg_all, split_all, log_fn=None)
+    uninterrupted.fit()
+
+    cfg_split = build(16, "split")
+    split_split, _ = parse_colmap(cfg_split)
+    first_leg = Trainer(cfg_split, split_split, log_fn=None)
+    # Run exactly 8 steps through the trainer's own path, then checkpoint.
+    gen = torch.Generator()
+    gen.manual_seed(cfg_split.train.seed)
+    loader = torch.utils.data.DataLoader(
+        first_leg.trainset,
+        batch_size=cfg_split.train.batch_size,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=collate,
+        generator=gen,
+    )
+    it = iter(loader)
+    for _ in range(8):
+        try:
+            batch = next(it)
+        except StopIteration:
+            it = iter(loader)
+            batch = next(it)
+        first_leg.train_step(batch)
+    ckpt = first_leg.save(tmp_path / "ck.pt")
+
+    resumed = Trainer(cfg_split, split_split, log_fn=None)
+    resumed.load(ckpt)
+    resumed.fit()
+
+    # The LR schedule must have continued, not restarted.
+    lr_all = uninterrupted.optimizers["means"].param_groups[0]["lr"]
+    lr_res = resumed.optimizers["means"].param_groups[0]["lr"]
+    assert abs(lr_all - lr_res) / lr_all < 1e-9, (
+        f"resumed means LR {lr_res:.6g} != uninterrupted {lr_all:.6g}; the decay "
+        "restarted instead of continuing"
+    )
+
+    # And the trajectories must agree to floating-point summation order.
+    diff = float(
+        (uninterrupted.params["means"].detach() - resumed.params["means"].detach())
+        .abs()
+        .max()
+    )
+    assert diff < 1e-6, (
+        f"resumed run diverged from the uninterrupted one: max|diff|={diff:.3e} "
+        "(pre-fix this was ~2.9e-05 from batch order alone)"
+    )
